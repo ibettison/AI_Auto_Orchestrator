@@ -1,4 +1,5 @@
 import os
+import multiprocessing
 import subprocess
 import tempfile
 import threading
@@ -32,6 +33,18 @@ class SliceBTests(unittest.TestCase):
         self.git(["config", "user.email", "slice-b@example.invalid"])
         (self.repo / "src").mkdir()
         (self.repo / "src" / "README.txt").write_text("clean\n")
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs" / "README.txt").write_text("docs\n")
+        (self.repo / "tools").mkdir()
+        (self.repo / "tools" / "long_command.py").write_text(
+            "import os\n"
+            "import pathlib\n"
+            "import time\n"
+            "marker = pathlib.Path(os.environ['SLICE_B_MARKER'])\n"
+            "marker.with_name('started').write_text('started')\n"
+            "time.sleep(2)\n"
+            "marker.with_name('finished').write_text('finished')\n"
+        )
         self.git(["add", "."])
         self.git(["commit", "-qm", "initial"])
         self.sha = self.git(["rev-parse", "HEAD"]).strip()
@@ -120,6 +133,8 @@ class SliceBTests(unittest.TestCase):
         timeout_command = ("python3", "-c", "__import__('time').sleep(1)")
         timed = BoundedRunner(FakeCodexAdapter(timeout_action)).run(self.config(command_timeout_seconds=0.05, allowed_commands=(timeout_command,), required_checks=(timeout_command,)))
         self.assertEqual(timed.status, "timed_out")
+        self.assertEqual(timed.commands_executed[0].status, "timed_out")
+        self.assertFalse(timed.validation_passed)
 
         def many_commands(_, __, commands):
             commands.run(("python3", "-c", "print('check')"))
@@ -133,10 +148,65 @@ class SliceBTests(unittest.TestCase):
         noisy = BoundedRunner(FakeCodexAdapter(lambda *_: AdapterResult(0, "x" * 100)),).run(self.config(max_output_size=10))
         self.assertEqual(noisy.status, "failed")
 
+        noisy_command = ("python3", "-c", "print('x' * 100)")
+        noisy_process = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(noisy_command), AdapterResult(0))[1])).run(self.config(max_output_size=10, allowed_commands=(noisy_command,), required_checks=(noisy_command,)))
+        self.assertEqual((noisy_process.status, noisy_process.commands_executed[0].status, noisy_process.validation_passed), ("failed", "output_limit_exceeded", False))
+
         failing_command = ("python3", "-c", "raise SystemExit(4)")
         failed_command = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(failing_command), AdapterResult(0))[1])).run(self.config(allowed_commands=(failing_command,), required_checks=(failing_command,)))
         self.assertEqual(failed_command.status, "failed")
+        self.assertEqual(failed_command.commands_executed[0].status, "non_zero_exit")
         self.assertIn("command failed", failed_command.failure_reason)
+
+    def test_overall_timeout_terminates_active_command_process_group(self):
+        marker = Path(self.temp.name) / "marker"
+        long_command = ("python3", "tools/long_command.py")
+
+        def action(_, __, commands):
+            commands.run(long_command)
+            return AdapterResult(0)
+
+        result = BoundedRunner(FakeCodexAdapter(action)).run(self.config(
+            run_id="active-command-timeout",
+            allowed_commands=(long_command,),
+            required_checks=(long_command,),
+            environment={"SLICE_B_MARKER": str(marker)},
+            timeout_seconds=0.2,
+            command_timeout_seconds=5,
+        ))
+        self.assertEqual(result.status, "timed_out")
+        self.assertTrue((marker.parent / "started").exists())
+        time.sleep(0.3)
+        self.assertFalse((marker.parent / "finished").exists())
+
+    def test_large_valid_adapter_payload_does_not_deadlock_ipc(self):
+        payload = "x" * (96 * 1024)
+        check = ("python3", "-c", "print('check')")
+
+        def action(_, __, commands):
+            commands.run(check)
+            return AdapterResult(0, payload)
+
+        result = BoundedRunner(FakeCodexAdapter(action)).run(self.config(max_output_size=128 * 1024))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(result.stdout_summary), len(payload))
+
+    def test_aggregate_command_and_adapter_output_limit_is_enforced(self):
+        noisy_command = ("python3", "-c", "print('x' * 40960)")
+
+        def action(_, __, commands):
+            commands.run(noisy_command)
+            return AdapterResult(0, "y" * 40960)
+
+        result = BoundedRunner(FakeCodexAdapter(action)).run(self.config(
+            run_id="aggregate-output-limit",
+            allowed_commands=(noisy_command,),
+            required_checks=(noisy_command,),
+            max_output_size=64 * 1024,
+        ))
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(result.validation_passed)
+        self.assertIn("output", result.failure_reason)
 
     def test_environment_is_allowlisted_and_network_is_denied(self):
         os.environ["SLICE_B_TEST_SECRET"] = "must-not-leak"
@@ -158,9 +228,74 @@ class SliceBTests(unittest.TestCase):
         interrupted = BoundedRunner(FakeCodexAdapter(lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))).run(self.config(run_id="interrupted"))
         self.assertEqual((interrupted.status, interrupted.failure_reason), ("interrupted", "runner interrupted"))
 
+    def test_indefinitely_blocked_adapter_is_terminated_and_lease_released(self):
+        def hung(_, workspace, __):
+            (workspace / "src" / "started.txt").write_text("started\n")
+            while True:
+                time.sleep(0.05)
+
+        runner = BoundedRunner(FakeCodexAdapter(hung), RunLeaseRegistry())
+        started = time.monotonic()
+        result = runner.run(self.config(timeout_seconds=0.2))
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(result.status, "timed_out")
+        self.assertEqual(result.files_changed, ("src/started.txt",))
+        self.assertTrue(any(item.action == "adapter_timeout" for item in result.audit))
+        self.assertTrue(any(item.action == "cleanup" for item in result.audit))
+
+        retry = BoundedRunner(self.checked_adapter(), runner.leases).run(self.config())
+        self.assertEqual(retry.status, "completed")
+
+    def test_unexpected_adapter_exception_is_structured_and_fail_closed(self):
+        def broken(*_):
+            raise RuntimeError("unexpected adapter failure")
+
+        result = BoundedRunner(FakeCodexAdapter(broken)).run(self.config())
+        self.assertEqual(result.status, "failed")
+        self.assertIn("adapter exception", result.failure_reason)
+        self.assertTrue(any(item.action == "cleanup" for item in result.audit))
+        coordinated = RunnerCoordinator(BoundedRunner(FakeCodexAdapter(broken))).run(self.config(run_id="unexpected-integration"))
+        self.assertEqual(coordinated.snapshot.state, State.BLOCKED)
+
+    def test_adapter_exit_without_result_is_structured_and_releases_resources(self):
+        def exits_without_result(*_):
+            os._exit(23)
+
+        leases = RunLeaseRegistry()
+        runner = BoundedRunner(FakeCodexAdapter(exits_without_result), leases)
+        config = self.config(run_id="empty-adapter-result")
+        result = runner.run(config)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("exited unexpectedly (23)", result.failure_reason)
+        self.assertTrue(any(item.action == "cleanup" for item in result.audit))
+
+        retry = BoundedRunner(self.checked_adapter(), leases).run(config)
+        self.assertEqual(retry.status, "completed")
+
+        coordinated = RunnerCoordinator(BoundedRunner(FakeCodexAdapter(exits_without_result))).run(self.config(run_id="empty-adapter-integration"))
+        self.assertEqual(coordinated.snapshot.state, State.BLOCKED)
+
+    def test_file_mode_changes_are_scope_checked(self):
+        def chmod_outside(_, workspace, commands):
+            (workspace / "docs" / "README.txt").chmod(0o755)
+            commands.run(("python3", "-c", "print('check')"))
+            return AdapterResult(0)
+
+        outside = BoundedRunner(FakeCodexAdapter(chmod_outside)).run(self.config(run_id="chmod-outside"))
+        self.assertEqual(outside.status, "failed")
+        self.assertEqual(outside.files_changed, ("docs/README.txt",))
+
+        def chmod_inside(_, workspace, commands):
+            (workspace / "src" / "README.txt").chmod(0o755)
+            commands.run(("python3", "-c", "print('check')"))
+            return AdapterResult(0)
+
+        inside = BoundedRunner(FakeCodexAdapter(chmod_inside)).run(self.config(run_id="chmod-inside"))
+        self.assertEqual((inside.status, inside.files_changed), ("completed", ("src/README.txt",)))
+
     def test_duplicate_active_run_is_rejected_and_retry_after_failure_works(self):
-        entered = threading.Event()
-        release = threading.Event()
+        entered = multiprocessing.Event()
+        release = multiprocessing.Event()
 
         def blocking(_, __, commands):
             entered.set()
