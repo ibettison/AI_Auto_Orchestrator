@@ -8,6 +8,7 @@ OS/container security boundary.
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
 import os
 import signal
 import shutil
@@ -36,6 +37,18 @@ class PolicyViolation(RunnerError):
 
 
 class BoundExceeded(RunnerError):
+    pass
+
+
+class TimeoutExceeded(BoundExceeded):
+    pass
+
+
+class OutputLimitExceeded(BoundExceeded):
+    pass
+
+
+class CommandLimitExceeded(BoundExceeded):
     pass
 
 
@@ -126,7 +139,7 @@ class CommandPolicy:
     def authorize(self, argv: Sequence[str]) -> tuple[str, ...]:
         command = _validate_argv(argv)
         if len(self.executed) >= self.max_commands:
-            raise BoundExceeded("maximum command count exceeded")
+            raise CommandLimitExceeded("maximum command count exceeded")
         if command not in self.allowed:
             raise PolicyViolation(f"command is not allowlisted: {command!r}")
         self.executed.append(command)
@@ -163,9 +176,11 @@ class CommandResult:
     stdout: str
     stderr: str
     duration_seconds: float
+    status: str = "completed"
+    failure_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {"argv": list(self.argv), "exit_code": self.exit_code, "stdout": self.stdout, "stderr": self.stderr, "duration_seconds": self.duration_seconds}
+        return {"argv": list(self.argv), "exit_code": self.exit_code, "stdout": self.stdout, "stderr": self.stderr, "duration_seconds": self.duration_seconds, "status": self.status, "failure_reason": self.failure_reason}
 
 
 class BoundedCommandRunner:
@@ -199,11 +214,13 @@ class BoundedCommandRunner:
         command = self.policy.authorize(argv)
         remaining = self.overall_deadline - time.monotonic()
         if remaining <= 0:
-            raise BoundExceeded("overall runner timeout exceeded")
+            raise TimeoutExceeded("overall runner timeout exceeded")
         started = time.monotonic()
         self.audit.append({"action": "command_attempted", "command": " ".join(command), "at": _now()})
         process = subprocess.Popen(command, cwd=self.workspace, env=self.environment, shell=False,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        record_index = len(self.results)
+        self.results.append(CommandResult(command, None, "", "", 0.0, "running"))
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
@@ -220,16 +237,18 @@ class BoundedCommandRunner:
                         key.fileobj.close()
                         continue
                     if self.captured_output + len(chunk) > self.max_output:
-                        raise BoundExceeded("maximum captured output exceeded")
+                        raise OutputLimitExceeded("maximum captured output exceeded")
                     buffers[key.data].extend(chunk)
                     self.captured_output += len(chunk)
             process.wait(timeout=0.1)
         except subprocess.TimeoutExpired as exc:
             self._terminate(process)
+            self.results[record_index] = CommandResult(command, process.returncode, "", "", time.monotonic() - started, "timed_out", "command timeout")
             self.audit.append({"action": "timeout", "command": " ".join(command), "at": _now()})
-            raise BoundExceeded(f"command timeout: {command!r}") from exc
-        except BoundExceeded:
+            raise TimeoutExceeded(f"command timeout: {command!r}") from exc
+        except OutputLimitExceeded:
             self._terminate(process)
+            self.results[record_index] = CommandResult(command, process.returncode, "", "", time.monotonic() - started, "output_limit_exceeded", "maximum captured output exceeded")
             raise
         finally:
             selector.close()
@@ -237,8 +256,8 @@ class BoundedCommandRunner:
                 if stream and not stream.closed:
                     stream.close()
         stdout, stderr = bytes(buffers["stdout"]), bytes(buffers["stderr"])
-        result = CommandResult(command, process.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace"), time.monotonic() - started)
-        self.results.append(result)
+        result = CommandResult(command, process.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace"), time.monotonic() - started, "completed" if process.returncode == 0 else "non_zero_exit", None if process.returncode == 0 else f"exit code {process.returncode}")
+        self.results[record_index] = result
         self.audit.append({"action": "command_completed" if result.exit_code == 0 else "command_failed", "command": " ".join(command), "at": _now()})
         if result.exit_code != 0:
             raise RunnerError(f"allowlisted command failed with exit code {result.exit_code}: {command!r}")
@@ -267,6 +286,48 @@ class FakeCodexAdapter:
         if self.action:
             return self.action(objective, workspace, commands)
         return AdapterResult(0, "fake codex completed", "")
+
+
+def _sanitized(value: object, limit: int = 512) -> str:
+    text = str(value).replace("\x00", " ").replace("\r", " ").replace("\n", " ")
+    return text[:limit]
+
+
+def _adapter_worker(adapter: CodexAdapter, objective: str, workspace: str, config: RunnerConfig, connection) -> None:
+    """Run adapter code in a killable process with a minimal environment."""
+    try:
+        os.setsid()
+    except AttributeError:
+        pass
+    os.environ.clear()
+    os.environ.update(EnvironmentPolicy(config.environment).build())
+    audit: list[dict[str, str]] = []
+    command_runner = BoundedCommandRunner(Path(workspace), CommandPolicy(config.allowed_commands, config.max_commands), os.environ, config.command_timeout_seconds, time.monotonic() + config.timeout_seconds, config.max_output_size, audit)
+    try:
+        result = adapter.run(objective, Path(workspace), command_runner)
+        if not isinstance(result, AdapterResult):
+            raise TypeError("adapter must return AdapterResult")
+        stdout = _sanitized(result.stdout, config.max_output_size)
+        stderr = _sanitized(result.stderr, config.max_output_size)
+        output_exceeded = len(str(result.stdout).encode()) + len(str(result.stderr).encode()) > config.max_output_size
+        connection.send({"kind": "result", "exit_code": result.exit_code, "stdout": stdout, "stderr": stderr,
+                         "failure_reason": _sanitized(result.failure_reason) if result.failure_reason else None,
+                         "commands": [item.to_dict() for item in command_runner.results], "audit": audit,
+                         "output_exceeded": output_exceeded})
+    except KeyboardInterrupt:
+        connection.send({"kind": "interrupted", "commands": [item.to_dict() for item in command_runner.results], "audit": audit})
+    except TimeoutExceeded as exc:
+        connection.send({"kind": "timed_out", "failure_reason": _sanitized(exc), "commands": [item.to_dict() for item in command_runner.results], "audit": audit})
+    except (OutputLimitExceeded, CommandLimitExceeded) as exc:
+        connection.send({"kind": "failed", "failure_reason": _sanitized(exc), "commands": [item.to_dict() for item in command_runner.results], "audit": audit})
+    except Exception as exc:
+        connection.send({"kind": "failed", "failure_reason": f"adapter exception: {_sanitized(exc)}", "commands": [item.to_dict() for item in command_runner.results], "audit": audit})
+    finally:
+        connection.close()
+
+
+def _command_results(values: list[dict[str, object]]) -> tuple[CommandResult, ...]:
+    return tuple(CommandResult(tuple(item["argv"]), item["exit_code"], item["stdout"], item["stderr"], item["duration_seconds"], item.get("status", "completed"), item.get("failure_reason")) for item in values)
 
 
 @dataclass(frozen=True)
@@ -321,8 +382,8 @@ class Workspace:
         self.root, self.workspace_id, self.branch, self.source_sha = root, workspace_id, branch, source_sha
         self.baseline = self.inventory()
 
-    def inventory(self) -> dict[str, str]:
-        files: dict[str, str] = {}
+    def inventory(self) -> dict[str, object]:
+        files: dict[str, object] = {}
         for path in self.root.rglob("*"):
             if ".git" in path.parts:
                 continue
@@ -330,7 +391,8 @@ class Workspace:
             if path.is_symlink():
                 files[relative] = "SYMLINK"
             elif path.is_file():
-                files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+                executable = bool(path.stat().st_mode & 0o111)
+                files[relative] = (hashlib.sha256(path.read_bytes()).hexdigest(), executable)
         return files
 
     def changed_files(self) -> tuple[str, ...]:
@@ -406,6 +468,52 @@ class BoundedRunner:
     def __init__(self, adapter: CodexAdapter, leases: RunLeaseRegistry | None = None):
         self.adapter, self.leases = adapter, leases or RunLeaseRegistry()
 
+    @staticmethod
+    def _terminate_adapter(process: multiprocessing.Process) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.join(timeout=1)
+        except (ProcessLookupError, AssertionError):
+            pass
+        if process.is_alive():
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+
+    def _run_adapter(self, config: RunnerConfig, workspace: Workspace, audit: list[dict[str, str]]) -> tuple[dict[str, object], tuple[CommandResult, ...]]:
+        context = multiprocessing.get_context("fork")
+        receiver, sender = context.Pipe(False)
+        process = context.Process(target=_adapter_worker, args=(self.adapter, config.objective, str(workspace.root), config, sender), name=f"orchestrator-adapter-{config.run_id}")
+        process.start()
+        sender.close()
+        deadline = time.monotonic() + config.timeout_seconds
+        try:
+            process.join(max(0.0, deadline - time.monotonic()))
+        except KeyboardInterrupt:
+            self._terminate_adapter(process)
+            audit.append({"action": "adapter_interrupted", "at": _now()})
+            receiver.close()
+            return ({"kind": "interrupted", "failure_reason": "runner interrupted"}, ())
+        if process.is_alive():
+            self._terminate_adapter(process)
+            audit.append({"action": "adapter_timeout", "at": _now()})
+            receiver.close()
+            process.close()
+            return ({"kind": "timed_out", "failure_reason": "adapter overall timeout"}, ())
+        payload: dict[str, object] | None = receiver.recv() if receiver.poll(0.1) else None
+        receiver.close()
+        process.close()
+        if payload is None:
+            return ({"kind": "failed", "failure_reason": f"adapter process exited unexpectedly ({process.exitcode})"}, ())
+        child_audit = payload.pop("audit", [])
+        audit.extend(child_audit)
+        return payload, _command_results(payload.pop("commands", []))
+
     def run(self, config: RunnerConfig) -> RunnerResult:
         started_clock, started_at = time.monotonic(), _now()
         audit_raw: list[dict[str, str]] = []
@@ -423,46 +531,48 @@ class BoundedRunner:
         else:
             try:
                 workspace = workspace_manager.prepare()
-                deadline = time.monotonic() + config.timeout_seconds
-                policy = CommandPolicy(config.allowed_commands, config.max_commands)
-                command_runner = BoundedCommandRunner(workspace.root, policy, EnvironmentPolicy(config.environment).build(), config.command_timeout_seconds, deadline, config.max_output_size, audit_raw)
-                result = self.adapter.run(config.objective, workspace.root, command_runner)
-                commands = tuple(command_runner.results)
-                stdout = result.stdout
-                stderr = result.stderr
-                if command_runner.captured_output + len(stdout.encode()) + len(stderr.encode()) > config.max_output_size:
-                    raise BoundExceeded("adapter output exceeded maximum captured output")
+                payload, commands = self._run_adapter(config, workspace, audit_raw)
+                stdout, stderr = str(payload.get("stdout", "")), str(payload.get("stderr", ""))
+                kind = str(payload.get("kind", "failed"))
+                failure = payload.get("failure_reason")
                 changed = workspace.changed_files()
                 if any(value == "SYMLINK" for value in workspace.inventory().values()):
                     raise PolicyViolation("symlinks are not permitted in the worker workspace")
                 PathPolicy(config.allowed_paths).verify(changed)
                 audit_raw.append({"action": "scope_verified", "at": _now()})
-                if result.exit_code != 0:
-                    exit_code, failure = result.exit_code, result.failure_reason or "Codex adapter failed"
+                if kind == "timed_out":
+                    status = "timed_out"
+                elif kind == "interrupted":
+                    status, failure = "interrupted", "runner interrupted"
+                elif kind != "result":
+                    status = "failed"
                 else:
-                    executed_checks = {command.argv for command in command_runner.results if command.exit_code == 0}
-                    missing_checks = tuple(check for check in config.required_checks if check not in executed_checks)
-                    if missing_checks:
-                        raise PolicyViolation(f"required validation checks were not run: {missing_checks!r}")
-                    validation_passed = True
-                    if time.monotonic() > deadline:
-                        raise BoundExceeded("overall runner timeout exceeded")
+                    exit_code = payload.get("exit_code")
+                    if payload.get("output_exceeded"):
+                        raise OutputLimitExceeded("adapter output exceeded maximum captured output")
+                    if exit_code != 0:
+                        failure = failure or "Codex adapter failed"
                     else:
+                        executed_checks = {command.argv for command in commands if command.status == "completed" and command.exit_code == 0}
+                        missing_checks = tuple(check for check in config.required_checks if check not in executed_checks)
+                        if missing_checks:
+                            raise PolicyViolation(f"required validation checks were not run: {missing_checks!r}")
+                        validation_passed = True
                         status, exit_code = "completed", 0
                         audit_raw.append({"action": "runner_completed", "at": _now()})
             except KeyboardInterrupt:
                 status, failure = "interrupted", "runner interrupted"
                 audit_raw.append({"action": "runner_interrupted", "at": _now()})
+            except TimeoutExceeded as exc:
+                status, failure = "timed_out", str(exc)
+                audit_raw.append({"action": "runner_timeout", "at": _now()})
             except BoundExceeded as exc:
-                failure = str(exc)
-                status = "timed_out" if "timeout" in failure else "failed"
-                audit_raw.append({"action": "runner_timeout" if status == "timed_out" else "runner_bound_exceeded", "at": _now()})
-            except (RunnerError, OSError, subprocess.SubprocessError) as exc:
                 status, failure = "failed", str(exc)
+                audit_raw.append({"action": "runner_bound_exceeded", "at": _now()})
+            except Exception as exc:
+                status, failure = "failed", _sanitized(exc)
                 audit_raw.append({"action": "runner_failed", "at": _now()})
             finally:
-                if 'command_runner' in locals():
-                    commands = tuple(command_runner.results)
                 self.leases.release(config.run_id)
                 workspace_manager.cleanup()
         ended_at = _now()
