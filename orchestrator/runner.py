@@ -505,11 +505,15 @@ class BoundedRunner:
             receiver.close()
             process.close()
             return ({"kind": "timed_out", "failure_reason": "adapter overall timeout"}, ())
-        payload: dict[str, object] | None = receiver.recv() if receiver.poll(0.1) else None
+        try:
+            payload: dict[str, object] | None = receiver.recv() if receiver.poll(0.1) else None
+        except EOFError:
+            payload = None
+        exitcode = process.exitcode
         receiver.close()
         process.close()
         if payload is None:
-            return ({"kind": "failed", "failure_reason": f"adapter process exited unexpectedly ({process.exitcode})"}, ())
+            return ({"kind": "failed", "failure_reason": f"adapter process exited unexpectedly ({exitcode})"}, ())
         child_audit = payload.pop("audit", [])
         audit.extend(child_audit)
         return payload, _command_results(payload.pop("commands", []))

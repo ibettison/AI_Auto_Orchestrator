@@ -197,6 +197,24 @@ class SliceBTests(unittest.TestCase):
         coordinated = RunnerCoordinator(BoundedRunner(FakeCodexAdapter(broken))).run(self.config(run_id="unexpected-integration"))
         self.assertEqual(coordinated.snapshot.state, State.BLOCKED)
 
+    def test_adapter_exit_without_result_is_structured_and_releases_resources(self):
+        def exits_without_result(*_):
+            os._exit(23)
+
+        leases = RunLeaseRegistry()
+        runner = BoundedRunner(FakeCodexAdapter(exits_without_result), leases)
+        config = self.config(run_id="empty-adapter-result")
+        result = runner.run(config)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("exited unexpectedly (23)", result.failure_reason)
+        self.assertTrue(any(item.action == "cleanup" for item in result.audit))
+
+        retry = BoundedRunner(self.checked_adapter(), leases).run(config)
+        self.assertEqual(retry.status, "completed")
+
+        coordinated = RunnerCoordinator(BoundedRunner(FakeCodexAdapter(exits_without_result))).run(self.config(run_id="empty-adapter-integration"))
+        self.assertEqual(coordinated.snapshot.state, State.BLOCKED)
+
     def test_file_mode_changes_are_scope_checked(self):
         def chmod_outside(_, workspace, commands):
             (workspace / "docs" / "README.txt").chmod(0o755)
