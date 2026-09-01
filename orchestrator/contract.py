@@ -54,6 +54,7 @@ class Risk(StrEnum):
 class EventType(StrEnum):
     START = "start"
     IMPLEMENTED = "implemented"
+    RUNNER_FAILED = "runner_failed"
     REVIEW_REQUESTED = "review_requested"
     REVIEW_PASSED = "review_passed"
     REVIEW_FINDINGS = "review_findings"
