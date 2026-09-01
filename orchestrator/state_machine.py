@@ -27,6 +27,7 @@ class IntegrityError(TransitionError):
 _TRANSITIONS = {
     (State.PLANNED, EventType.START): State.IMPLEMENTING,
     (State.IMPLEMENTING, EventType.IMPLEMENTED): State.REVIEWING,
+    (State.IMPLEMENTING, EventType.RUNNER_FAILED): State.BLOCKED,
     (State.REVIEWING, EventType.REVIEW_REQUESTED): State.REVIEWING,
     (State.REVIEWING, EventType.REVIEW_PASSED): State.COMPLETE,
     (State.REVIEWING, EventType.REVIEW_FINDINGS): State.FIXING,
