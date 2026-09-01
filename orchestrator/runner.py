@@ -74,6 +74,7 @@ class RunnerConfig:
     allowed_paths: tuple[str, ...]
     allowed_commands: tuple[tuple[str, ...], ...]
     objective: str
+    required_checks: tuple[tuple[str, ...], ...] = ()
     timeout_seconds: float = 60.0
     command_timeout_seconds: float = 20.0
     max_output_size: int = 64 * 1024
@@ -100,6 +101,12 @@ class RunnerConfig:
             raise UnsafeConfiguration("allowed_commands must not be empty")
         for command in self.allowed_commands:
             _validate_argv(command, "allowed command")
+        if not self.required_checks:
+            raise UnsafeConfiguration("required_checks must contain at least one validation command")
+        for check in self.required_checks:
+            normalized = _validate_argv(check, "required check")
+            if normalized not in self.allowed_commands:
+                raise UnsafeConfiguration("every required check must be explicitly allowlisted")
         if self.timeout_seconds <= 0 or self.command_timeout_seconds <= 0:
             raise UnsafeConfiguration("timeouts must be positive")
         if self.max_output_size < 1 or self.max_commands < 1 or self.max_review_cycles < 1:
@@ -283,6 +290,9 @@ class RunnerResult:
     commands_executed: tuple[CommandResult, ...]
     files_changed: tuple[str, ...]
     checks_attempted: tuple[tuple[str, ...], ...]
+    required_checks: tuple[tuple[str, ...], ...]
+    missing_checks: tuple[tuple[str, ...], ...]
+    validation_passed: bool
     stdout_summary: str
     stderr_summary: str
     failure_reason: str | None
@@ -297,6 +307,9 @@ class RunnerResult:
             "workspace_id": self.workspace_id, "status": self.status, "exit_code": self.exit_code,
             "commands_executed": [item.to_dict() for item in self.commands_executed],
             "files_changed": list(self.files_changed), "tests_checks_attempted": [list(item) for item in self.checks_attempted],
+            "required_checks": [list(item) for item in self.required_checks],
+            "missing_checks": [list(item) for item in self.missing_checks],
+            "validation_passed": self.validation_passed,
             "stdout_summary": self.stdout_summary, "stderr_summary": self.stderr_summary,
             "failure_reason": self.failure_reason, "started_at": self.started_at, "ended_at": self.ended_at,
             "duration_seconds": self.duration_seconds, "audit": [item.to_dict() for item in self.audit],
@@ -400,6 +413,8 @@ class BoundedRunner:
         workspace: Workspace | None = None
         status, exit_code, failure = "failed", None, None
         commands: tuple[CommandResult, ...] = ()
+        missing_checks: tuple[tuple[str, ...], ...] = config.required_checks
+        validation_passed = False
         changed: tuple[str, ...] = ()
         stdout, stderr = "", ""
         if not self.leases.acquire(config.run_id):
@@ -424,11 +439,17 @@ class BoundedRunner:
                 audit_raw.append({"action": "scope_verified", "at": _now()})
                 if result.exit_code != 0:
                     exit_code, failure = result.exit_code, result.failure_reason or "Codex adapter failed"
-                elif time.monotonic() > deadline:
-                    raise BoundExceeded("overall runner timeout exceeded")
                 else:
-                    status, exit_code = "completed", 0
-                    audit_raw.append({"action": "runner_completed", "at": _now()})
+                    executed_checks = {command.argv for command in command_runner.results if command.exit_code == 0}
+                    missing_checks = tuple(check for check in config.required_checks if check not in executed_checks)
+                    if missing_checks:
+                        raise PolicyViolation(f"required validation checks were not run: {missing_checks!r}")
+                    validation_passed = True
+                    if time.monotonic() > deadline:
+                        raise BoundExceeded("overall runner timeout exceeded")
+                    else:
+                        status, exit_code = "completed", 0
+                        audit_raw.append({"action": "runner_completed", "at": _now()})
             except KeyboardInterrupt:
                 status, failure = "interrupted", "runner interrupted"
                 audit_raw.append({"action": "runner_interrupted", "at": _now()})
@@ -450,4 +471,4 @@ class BoundedRunner:
         if not stderr and commands:
             stderr = "\n".join(result.stderr for result in commands)
         audit = tuple(AuditRecord(item.pop("action"), item.pop("at"), item) for item in audit_raw)
-        return RunnerResult(config.run_id, config.source_sha, workspace.branch if workspace else f"codex/{config.run_id}-unprepared", workspace_manager.workspace_id, status, exit_code, commands, changed, tuple(command.argv for command in commands), stdout, stderr, failure, started_at, ended_at, time.monotonic() - started_clock, audit)
+        return RunnerResult(config.run_id, config.source_sha, workspace.branch if workspace else f"codex/{config.run_id}-unprepared", workspace_manager.workspace_id, status, exit_code, commands, changed, tuple(command.argv for command in commands), config.required_checks, missing_checks, validation_passed, stdout, stderr, failure, started_at, ended_at, time.monotonic() - started_clock, audit)

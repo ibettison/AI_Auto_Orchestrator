@@ -37,8 +37,9 @@ def scenario_red_gate():
 
 
 def _runner_config(repo: Path, sha: str, run_id: str, **overrides):
+    check = ("python3", "-c", "print('check')")
     values = dict(run_id=run_id, repository=str(repo), source_sha=sha, allowed_paths=("src",),
-                  allowed_commands=(("python3", "-c", "print('check')"),), objective="offline Slice B scenario",
+                  allowed_commands=(check,), required_checks=(check,), objective="offline Slice B scenario",
                   command_timeout_seconds=0.1)
     values.update(overrides)
     return RunnerConfig(**values)
@@ -82,10 +83,11 @@ def scenario_runner_failure():
 def scenario_runner_timeout():
     directory, repo, sha = _temporary_repo()
     try:
+        timeout_command = ("python3", "-c", "__import__('time').sleep(1)")
         def action(_, __, commands):
-            commands.run(("python3", "-c", "__import__('time').sleep(1)"))
+            commands.run(timeout_command)
             return AdapterResult(0)
-        return BoundedRunner(FakeCodexAdapter(action)).run(_runner_config(repo, sha, "sim-runner-timeout", allowed_commands=(("python3", "-c", "__import__('time').sleep(1)"),)))
+        return BoundedRunner(FakeCodexAdapter(action)).run(_runner_config(repo, sha, "sim-runner-timeout", allowed_commands=(timeout_command,), required_checks=(timeout_command,)))
     finally:
         directory.cleanup()
 

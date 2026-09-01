@@ -27,7 +27,7 @@ class RunnerCoordinator:
         state_machine = Orchestrator(config.run_id, config.source_sha, config.max_review_cycles)
         state_machine.apply(self._event(config, 1, 0, EventType.START, objective=config.objective))
         result = self.runner.run(config)
-        if result.status == "completed":
+        if result.status == "completed" and result.validation_passed:
             snapshot = state_machine.apply(self._event(config, 2, 1, EventType.IMPLEMENTED, tests_pass=True, branch=result.branch, workspace_id=result.workspace_id))
         else:
             snapshot = state_machine.apply(self._event(config, 2, 1, EventType.RUNNER_FAILED, tests_pass=False, failure_reason=result.failure_reason or result.status))

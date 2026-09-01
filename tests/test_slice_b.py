@@ -45,10 +45,18 @@ class SliceBTests(unittest.TestCase):
         return result.stdout
 
     def config(self, **changes):
+        check = ("python3", "-c", "print('check')")
         values = dict(run_id="run-1", repository=str(self.repo), source_sha=self.sha,
-                      allowed_paths=("src",), allowed_commands=(("python3", "-c", "print('check')"),), objective="make the bounded change")
+                      allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="make the bounded change")
         values.update(changes)
         return RunnerConfig(**values)
+
+    @staticmethod
+    def checked_adapter(output="checked"):
+        def action(_, __, commands):
+            commands.run(("python3", "-c", "print('check')"))
+            return AdapterResult(0, output)
+        return FakeCodexAdapter(action)
 
     def test_valid_unattended_run_and_cleanup(self):
         def action(objective, workspace, commands):
@@ -70,6 +78,8 @@ class SliceBTests(unittest.TestCase):
             self.config(allowed_paths=("../src",))
         with self.assertRaises(UnsafeConfiguration):
             self.config(allowed_paths=("/tmp",))
+        with self.assertRaises(UnsafeConfiguration):
+            self.config(required_checks=())
 
     def test_wrong_or_stale_source_sha_fails_closed(self):
         result = BoundedRunner(FakeCodexAdapter()).run(self.config(source_sha="0" * 40))
@@ -107,7 +117,8 @@ class SliceBTests(unittest.TestCase):
             commands.run(("python3", "-c", "__import__('time').sleep(1)"))
             return AdapterResult(0)
 
-        timed = BoundedRunner(FakeCodexAdapter(timeout_action)).run(self.config(command_timeout_seconds=0.05, allowed_commands=(("python3", "-c", "__import__('time').sleep(1)"),)))
+        timeout_command = ("python3", "-c", "__import__('time').sleep(1)")
+        timed = BoundedRunner(FakeCodexAdapter(timeout_action)).run(self.config(command_timeout_seconds=0.05, allowed_commands=(timeout_command,), required_checks=(timeout_command,)))
         self.assertEqual(timed.status, "timed_out")
 
         def many_commands(_, __, commands):
@@ -122,7 +133,8 @@ class SliceBTests(unittest.TestCase):
         noisy = BoundedRunner(FakeCodexAdapter(lambda *_: AdapterResult(0, "x" * 100)),).run(self.config(max_output_size=10))
         self.assertEqual(noisy.status, "failed")
 
-        failed_command = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(("python3", "-c", "raise SystemExit(4)")), AdapterResult(0))[1])).run(self.config(allowed_commands=(("python3", "-c", "raise SystemExit(4)"),)))
+        failing_command = ("python3", "-c", "raise SystemExit(4)")
+        failed_command = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(failing_command), AdapterResult(0))[1])).run(self.config(allowed_commands=(failing_command,), required_checks=(failing_command,)))
         self.assertEqual(failed_command.status, "failed")
         self.assertIn("command failed", failed_command.failure_reason)
 
@@ -135,7 +147,7 @@ class SliceBTests(unittest.TestCase):
             return AdapterResult(0)
 
         env_command = ("python3", "-c", "print(__import__('os').environ.get('SLICE_B_TEST_SECRET', 'MISSING'))")
-        result = BoundedRunner(FakeCodexAdapter(action)).run(self.config(environment={}, allowed_commands=(env_command,)))
+        result = BoundedRunner(FakeCodexAdapter(action)).run(self.config(environment={}, allowed_commands=(env_command,), required_checks=(env_command,)))
         self.assertEqual(result.status, "completed")
         with self.assertRaises(UnsafeConfiguration):
             self.config(network_requested=True)
@@ -150,9 +162,10 @@ class SliceBTests(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
 
-        def blocking(_, __, ___):
+        def blocking(_, __, commands):
             entered.set()
             release.wait(2)
+            commands.run(("python3", "-c", "print('check')"))
             return AdapterResult(0)
 
         runner = BoundedRunner(FakeCodexAdapter(blocking), RunLeaseRegistry())
@@ -169,7 +182,7 @@ class SliceBTests(unittest.TestCase):
         self.assertEqual(retry.status, "failed")
 
     def test_structured_result_and_audit_never_include_environment_secret(self):
-        result = BoundedRunner(FakeCodexAdapter()).run(self.config(environment={"SAFE": "yes"}))
+        result = BoundedRunner(self.checked_adapter()).run(self.config(environment={"SAFE": "yes"}))
         encoded = str(result.to_dict())
         self.assertIn("run-1", encoded)
         self.assertIn("workspace_created", encoded)
@@ -177,7 +190,7 @@ class SliceBTests(unittest.TestCase):
         self.assertEqual(result.source_sha, self.sha)
 
     def test_slice_a_integration_success_failure_and_replay(self):
-        success = RunnerCoordinator(BoundedRunner(FakeCodexAdapter())).run(self.config(run_id="integration-success"))
+        success = RunnerCoordinator(BoundedRunner(self.checked_adapter())).run(self.config(run_id="integration-success"))
         self.assertEqual(success.snapshot.state, State.REVIEWING)
         replayed = Orchestrator("integration-success", self.sha).replay([
             RunnerCoordinator._event(self.config(run_id="integration-success"), 1, 0, EventType.START, objective="make the bounded change"),
@@ -198,7 +211,12 @@ class SliceBTests(unittest.TestCase):
             (workspace / "src" / "result.txt").write_text("external side effect marker")
             return AdapterResult(0)
 
-        result = RunnerCoordinator(BoundedRunner(FakeCodexAdapter(red_action))).run(self.config(run_id="red-integration"))
+        def checked_red_action(objective, workspace, commands):
+            red_action(objective, workspace, commands)
+            commands.run(("python3", "-c", "print('check')"))
+            return AdapterResult(0)
+
+        result = RunnerCoordinator(BoundedRunner(FakeCodexAdapter(checked_red_action))).run(self.config(run_id="red-integration"))
         self.assertEqual(result.snapshot.state, State.REVIEWING)
         gated = Orchestrator("red-integration", self.sha).replay([
             RunnerCoordinator._event(self.config(run_id="red-integration"), 1, 0, EventType.START, objective="make the bounded change"),
@@ -208,6 +226,13 @@ class SliceBTests(unittest.TestCase):
         self.assertEqual((gated.state, gated.risk, gated.red_pending), (State.HUMAN_DECISION_REQUIRED, Risk.RED, True))
         # The runner cannot approve a RED action; a later Slice A event still gates it.
         self.assertEqual(result.runner.files_changed, ("src/result.txt",))
+
+    def test_successful_adapter_without_required_checks_cannot_be_trusted(self):
+        result = BoundedRunner(FakeCodexAdapter()).run(self.config(run_id="no-checks-run"))
+        self.assertEqual((result.status, result.validation_passed), ("failed", False))
+        coordinated = RunnerCoordinator(BoundedRunner(FakeCodexAdapter())).run(self.config(run_id="no-checks-coordinated"))
+        self.assertEqual(coordinated.snapshot.state, State.BLOCKED)
+        self.assertNotEqual(coordinated.snapshot.state, State.REVIEWING)
 
 
 if __name__ == "__main__":
