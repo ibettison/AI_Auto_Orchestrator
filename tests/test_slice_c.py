@@ -1,7 +1,9 @@
+import json
 import hashlib
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from orchestrator.contract import State
@@ -60,10 +62,12 @@ class SliceCTests(unittest.TestCase):
             base_sha=self.base, expected_head_sha=head, validation_evidence={"passed": True}, cycle=cycle, risk=risk,
         )
 
-    def implementation(self, source_sha=None):
+    def implementation(self, source_sha=None, diff_digest=None):
         check = ("python3", "-c", "print('check')")
-        config = RunnerConfig(run_id="slice-c-run", repository=str(self.repo), source_sha=source_sha or self.base,
-                              allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="implement change")
+        source_sha = source_sha or self.head
+        diff_digest = diff_digest or self.request(source_sha).diff_digest
+        config = RunnerConfig(run_id="slice-c-run", repository=str(self.repo), source_sha=source_sha,
+                              allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="implement change", validation_diff_digest=diff_digest)
         return BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(config)
 
     @staticmethod
@@ -94,7 +98,8 @@ class SliceCTests(unittest.TestCase):
         def fixer(old, _review):
             self.commit_change("fixed defect")
             new_head = self.git("rev-parse", "HEAD").strip()
-            return self.implementation(new_head), self.request(new_head, 2)
+            next_request = self.request(new_head, 2)
+            return self.implementation(new_head, next_request.diff_digest), next_request
 
         result = ReviewFixLoop(reviewer, max_cycles=2).execute(request, self.implementation(), fixer)
         self.assertEqual(result.state, State.COMPLETE)
@@ -117,6 +122,29 @@ class SliceCTests(unittest.TestCase):
         result = ReviewFixLoop(FakeReviewer([bad])).execute(request, self.implementation())
         self.assertEqual(result.state, State.HUMAN_DECISION_REQUIRED)
         self.assertNotEqual(result.review_results, (bad,))
+
+    def test_unrelated_validation_result_cannot_approve_review(self):
+        request = self.request()
+        unrelated = replace(self.implementation(request.head_sha, request.diff_digest), run_id="other-run")
+        result = ReviewFixLoop(FakeReviewer([self.approved(request)])).execute(request, unrelated)
+        self.assertEqual(result.state, State.BLOCKED)
+
+    def test_fixer_failure_escalates_from_fixing(self):
+        request = self.request()
+        result = ReviewFixLoop(FakeReviewer([self.finding_result(request)])).execute(request, self.implementation(), lambda *_: (_ for _ in ()).throw(RuntimeError("fixer crashed")))
+        self.assertEqual(result.state, State.HUMAN_DECISION_REQUIRED)
+
+    def test_stale_fix_validation_cannot_apply_to_new_head(self):
+        request = self.request()
+        initial = self.implementation()
+
+        def fixer(old, _review):
+            self.commit_change("new unvalidated head")
+            new_head = self.git("rev-parse", "HEAD").strip()
+            return initial, self.request(new_head, 2)
+
+        result = ReviewFixLoop(FakeReviewer([self.finding_result(request)])).execute(request, initial, fixer)
+        self.assertEqual(result.state, State.HUMAN_DECISION_REQUIRED)
 
     def test_scenario_e_repeated_finding_exhausts_without_loop(self):
         request = self.request()
@@ -186,6 +214,8 @@ class SliceCTests(unittest.TestCase):
         self.assertEqual(result.verdict, Verdict.APPROVED)
         self.assertEqual((captured["body"]["store"], captured["body"]["text"]["format"]["type"]), (False, "json_schema"))
         self.assertIn(request.head_sha, captured["body"]["input"][1]["content"])
+        self.assertIn(request.review_id, captured["body"]["input"][1]["content"])
+        self.assertIn(request.run_id, captured["body"]["input"][1]["content"])
         self.assertEqual(result.provider_metadata["usage"]["total_tokens"], 20)
 
         with self.assertRaises(ProviderFailure):
@@ -215,6 +245,11 @@ class SliceCTests(unittest.TestCase):
         self.assertEqual((findings["maxItems"], item["additionalProperties"]), (100, False))
         self.assertIn("remediation", item["required"])
         self.assertEqual(item["properties"]["severity"]["enum"], ["P0", "P1", "P2", "P3"])
+
+    def test_simulator_allows_direct_review_scenario_selection(self):
+        output = subprocess.run(["python3", "-m", "orchestrator.simulator", "--scenario", "review-clean"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        self.assertEqual(output.returncode, 0, output.stderr)
+        self.assertEqual(json.loads(output.stdout)["review-clean"]["state"], "complete")
 
 
 if __name__ == "__main__":

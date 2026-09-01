@@ -112,7 +112,7 @@ def _review_fixture(run_id="sim-review"):
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
     request = ReviewInputPreparer().prepare(review_id=f"{run_id}-1", run_id=run_id, repository=str(repo), objective="offline review", base_sha=base, expected_head_sha=head, validation_evidence={"passed": True}, cycle=1)
     check = ("python3", "-c", "print('check')")
-    config = RunnerConfig(run_id=run_id, repository=str(repo), source_sha=base, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation")
+    config = RunnerConfig(run_id=run_id, repository=str(repo), source_sha=head, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation", validation_diff_digest=request.diff_digest)
     implementation = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(config)
     return directory, repo, request, implementation
 
@@ -144,9 +144,9 @@ def scenario_review_fix():
             subprocess.run(["git", "commit", "-qm", "fix"], cwd=repo, check=True)
             head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
             check = ("python3", "-c", "print('check')")
-            cfg = RunnerConfig(run_id="sim-review-fix", repository=str(repo), source_sha=head, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation")
-            run = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(cfg)
             next_request = ReviewInputPreparer().prepare(review_id="sim-review-fix-2", run_id="sim-review-fix", repository=str(repo), objective="offline review", base_sha=request.base_sha, expected_head_sha=head, validation_evidence={"passed": True}, cycle=2)
+            cfg = RunnerConfig(run_id="sim-review-fix", repository=str(repo), source_sha=head, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation", validation_diff_digest=next_request.diff_digest)
+            run = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(cfg)
             return run, next_request
         return _review_value(ReviewFixLoop(FakeReviewer(review), max_cycles=2).execute(request, implementation, fixer))
     finally:
@@ -185,8 +185,9 @@ def scenario_review_repeat():
             subprocess.run(["git", "commit", "-qm", "progress"], cwd=repo, check=True)
             head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
             check = ("python3", "-c", "print('check')")
-            run = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(RunnerConfig(run_id="sim-review-repeat", repository=str(repo), source_sha=head, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation"))
-            return run, ReviewInputPreparer().prepare(review_id=f"sim-review-repeat-{old.cycle + 1}", run_id="sim-review-repeat", repository=str(repo), objective="offline review", base_sha=request.base_sha, expected_head_sha=head, validation_evidence={"passed": True}, cycle=old.cycle + 1)
+            next_request = ReviewInputPreparer().prepare(review_id=f"sim-review-repeat-{old.cycle + 1}", run_id="sim-review-repeat", repository=str(repo), objective="offline review", base_sha=request.base_sha, expected_head_sha=head, validation_evidence={"passed": True}, cycle=old.cycle + 1)
+            run = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(RunnerConfig(run_id="sim-review-repeat", repository=str(repo), source_sha=head, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation", validation_diff_digest=next_request.diff_digest))
+            return run, next_request
         result = ReviewFixLoop(FakeReviewer(lambda current: ReviewResult(current.review_id, current.head_sha, Verdict.CHANGES_REQUESTED, (finding,))), max_cycles=3, repeat_threshold=2).execute(request, implementation, fixer)
         return _review_value(result)
     finally:
@@ -219,7 +220,7 @@ def scenario_review_provider_failure():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=["green", "amber-fix", "red-gate", "runner", "all"], default="all")
+    parser.add_argument("--scenario", choices=["green", "amber-fix", "red-gate", "review-clean", "review-fix", "review-stale", "review-malformed", "review-repeat", "review-human", "review-red", "review-provider-failure", "runner", "all"], default="all")
     args = parser.parse_args()
     scenarios = {"green": scenario_green, "amber-fix": scenario_amber_fix, "red-gate": scenario_red_gate,
                  "review-clean": scenario_review_clean, "review-fix": scenario_review_fix, "review-stale": scenario_review_stale,

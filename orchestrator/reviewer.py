@@ -235,7 +235,7 @@ class OpenAIResponsesReviewer:
         request.validate()
         if self.transport is None:
             raise ProviderFailure("live OpenAI transport is disabled in Slice C")
-        body = {"model": self.model, "store": False, "input": [{"role": "system", "content": REVIEW_INSTRUCTIONS}, {"role": "user", "content": json.dumps({"objective": request.objective, "repository": request.repository, "base_sha": request.base_sha, "head_sha": request.head_sha, "diff": request.diff, "validation_evidence": dict(request.validation_evidence), "cycle": request.cycle}, sort_keys=True)}], "text": {"format": {"type": "json_schema", "name": "independent_review", "strict": True, "schema": REVIEW_JSON_SCHEMA}}, "max_output_tokens": self.max_output_tokens}
+        body = {"model": self.model, "store": False, "input": [{"role": "system", "content": REVIEW_INSTRUCTIONS}, {"role": "user", "content": json.dumps({"review_id": request.review_id, "run_id": request.run_id, "objective": request.objective, "repository": request.repository, "base_sha": request.base_sha, "head_sha": request.head_sha, "diff": request.diff, "validation_evidence": dict(request.validation_evidence), "cycle": request.cycle}, sort_keys=True)}], "text": {"format": {"type": "json_schema", "name": "independent_review", "strict": True, "schema": REVIEW_JSON_SCHEMA}}, "max_output_tokens": self.max_output_tokens}
         started = time.monotonic()
         try:
             raw = self.transport(body, self.timeout_seconds)
@@ -315,9 +315,9 @@ class ReviewFixLoop:
         request.validate()
         machine = Orchestrator(request.run_id, request.base_sha, self.max_cycles)
         machine.apply(_event(request, 1, EventType.START))
-        if implementation.status != "completed" or not implementation.validation_passed:
+        if not self._validation_bound(implementation, request) or implementation.status != "completed" or not implementation.validation_passed:
             machine.apply(_event(request, 2, EventType.RUNNER_FAILED, tests_pass=False, failure_reason=implementation.failure_reason or "validation failed"))
-            return LoopResult(machine.snapshot.state, (), tuple(self.github.records), implementation.failure_reason)
+            return LoopResult(machine.snapshot.state, (), tuple(self.github.records), implementation.failure_reason or "validation identity did not match review")
         machine.apply(_event(request, 2, EventType.IMPLEMENTED, tests_pass=True, head_sha=request.head_sha, destructive=request.risk == "red"))
         results: list[ReviewResult] = []
         seen_fingerprints: dict[str, int] = {}
@@ -357,7 +357,7 @@ class ReviewFixLoop:
             try:
                 fixed, next_request = fixer(current, review)
                 next_request.validate()
-                if next_request.head_sha == current.head_sha or next_request.base_sha != current.base_sha or fixed.status != "completed" or not fixed.validation_passed:
+                if next_request.head_sha == current.head_sha or next_request.base_sha != current.base_sha or not self._validation_bound(fixed, next_request) or fixed.status != "completed" or not fixed.validation_passed:
                     raise ReviewError("fix did not produce a validated new head")
             except Exception as exc:
                 return self._human(machine, current, results, f"fix failed: {_bounded(exc)}")
@@ -366,9 +366,13 @@ class ReviewFixLoop:
         return self._human(machine, current, results, "review cycle limit reached")
 
     def _human(self, machine: Orchestrator, request: ReviewRequest, results: list[ReviewResult], reason: str) -> LoopResult:
-        if machine.snapshot.state == State.REVIEWING:
+        if machine.snapshot.state in (State.REVIEWING, State.FIXING):
             machine.apply(_event(request, machine.snapshot.version + 1, EventType.REVIEW_FINDINGS, human_required=True, gate_reason=_bounded(reason), findings=[]))
         return LoopResult(machine.snapshot.state, tuple(results), tuple(self.github.records), reason)
+
+    @staticmethod
+    def _validation_bound(result: RunnerResult, request: ReviewRequest) -> bool:
+        return result.run_id == request.run_id and result.source_sha.lower() == request.head_sha.lower() and result.validation_diff_digest == request.diff_digest
 
 
 def _event(request: ReviewRequest, sequence: int, event_type: EventType, **payload: Any):
