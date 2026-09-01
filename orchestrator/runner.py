@@ -95,6 +95,7 @@ class RunnerConfig:
     environment: Mapping[str, str] = field(default_factory=dict)
     network_requested: bool = False
     max_review_cycles: int = 2
+    validation_diff_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in self.run_id):
@@ -128,6 +129,8 @@ class RunnerConfig:
             raise UnsafeConfiguration("network access is denied: no hard network sandbox is available")
         if not isinstance(self.environment, Mapping) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in self.environment.items()):
             raise UnsafeConfiguration("environment must be an explicit string mapping")
+        if self.validation_diff_digest is not None and (len(self.validation_diff_digest) != 64 or any(c not in "0123456789abcdefABCDEF" for c in self.validation_diff_digest)):
+            raise UnsafeConfiguration("validation_diff_digest must be a SHA-256 digest")
 
 
 class CommandPolicy:
@@ -374,6 +377,7 @@ class RunnerResult:
     ended_at: str
     duration_seconds: float
     audit: tuple[AuditRecord, ...]
+    validation_diff_digest: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -387,6 +391,7 @@ class RunnerResult:
             "stdout_summary": self.stdout_summary, "stderr_summary": self.stderr_summary,
             "failure_reason": self.failure_reason, "started_at": self.started_at, "ended_at": self.ended_at,
             "duration_seconds": self.duration_seconds, "audit": [item.to_dict() for item in self.audit],
+            "validation_diff_digest": self.validation_diff_digest,
         }
 
 
@@ -507,16 +512,18 @@ class BoundedRunner:
         deadline = time.monotonic() + config.timeout_seconds
         try:
             payload: dict[str, object] | None = None
+            pipe_closed = False
             while process.is_alive() and payload is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                if receiver.poll(min(0.05, remaining)):
+                if pipe_closed:
+                    process.join(min(0.01, remaining))
+                elif receiver.poll(min(0.05, remaining)):
                     try:
                         payload = receiver.recv()
                     except EOFError:
-                        payload = None
-                        break
+                        pipe_closed = True
                 else:
                     process.join(min(0.01, remaining))
             while payload is not None and process.is_alive():
@@ -616,4 +623,4 @@ class BoundedRunner:
         if not stderr and commands:
             stderr = "\n".join(result.stderr for result in commands)
         audit = tuple(AuditRecord(item.pop("action"), item.pop("at"), item) for item in audit_raw)
-        return RunnerResult(config.run_id, config.source_sha, workspace.branch if workspace else f"codex/{config.run_id}-unprepared", workspace_manager.workspace_id, status, exit_code, commands, changed, tuple(command.argv for command in commands), config.required_checks, missing_checks, validation_passed, stdout, stderr, failure, started_at, ended_at, time.monotonic() - started_clock, audit)
+        return RunnerResult(config.run_id, config.source_sha, workspace.branch if workspace else f"codex/{config.run_id}-unprepared", workspace_manager.workspace_id, status, exit_code, commands, changed, tuple(command.argv for command in commands), config.required_checks, missing_checks, validation_passed, stdout, stderr, failure, started_at, ended_at, time.monotonic() - started_clock, audit, config.validation_diff_digest)

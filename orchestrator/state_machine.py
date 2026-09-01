@@ -31,6 +31,7 @@ _TRANSITIONS = {
     (State.REVIEWING, EventType.REVIEW_REQUESTED): State.REVIEWING,
     (State.REVIEWING, EventType.REVIEW_PASSED): State.COMPLETE,
     (State.REVIEWING, EventType.REVIEW_FINDINGS): State.FIXING,
+    (State.FIXING, EventType.REVIEW_FINDINGS): State.HUMAN_DECISION_REQUIRED,
     (State.HUMAN_DECISION_REQUIRED, EventType.HUMAN_DECISION): State.FIXING,
     (State.FIXING, EventType.FIX_APPLIED): State.REVIEWING,
     (State.BLOCKED, EventType.RECOVER): State.RECOVERY,
@@ -83,7 +84,9 @@ class Orchestrator:
         decision = payload.get("decision", s.human_decision)
 
         if event.event_type == EventType.REVIEW_FINDINGS:
-            if red_pending:
+            if payload.get("human_required"):
+                next_state, gate_reason = State.HUMAN_DECISION_REQUIRED, payload.get("gate_reason", "review_requires_human_decision")
+            elif red_pending:
                 next_state, gate_reason = State.HUMAN_DECISION_REQUIRED, "red_risk_requires_human_approval"
             elif cycles > self.max_review_cycles:
                 next_state, gate_reason = State.HUMAN_DECISION_REQUIRED, "automatic_review_cycle_limit_reached"

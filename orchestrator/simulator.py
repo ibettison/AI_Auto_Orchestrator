@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from .contract import Event, EventType
+from .reviewer import Finding, FakeReviewer, ProviderFailure, ReviewFixLoop, ReviewInputPreparer, ReviewResult, Severity, Verdict
 from .runner import AdapterResult, BoundedRunner, FakeCodexAdapter, RunnerConfig
 from .state_machine import Orchestrator
 
@@ -103,19 +104,141 @@ def scenario_runner_scope_violation():
         directory.cleanup()
 
 
+def _review_fixture(run_id="sim-review"):
+    directory, repo, base = _temporary_repo()
+    (repo / "src" / "result.txt").write_text("change\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "change"], cwd=repo, check=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
+    request = ReviewInputPreparer().prepare(review_id=f"{run_id}-1", run_id=run_id, repository=str(repo), objective="offline review", base_sha=base, expected_head_sha=head, validation_evidence={"passed": True}, cycle=1)
+    check = ("python3", "-c", "print('check')")
+    config = RunnerConfig(run_id=run_id, repository=str(repo), source_sha=head, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation", validation_diff_digest=request.diff_digest)
+    implementation = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(config)
+    return directory, repo, request, implementation
+
+
+def _review_value(result):
+    return {"state": result.state.value, "reviews": len(result.review_results), "reason": result.reason}
+
+
+def scenario_review_clean():
+    directory, repo, request, implementation = _review_fixture("sim-review-clean")
+    try:
+        result = ReviewFixLoop(FakeReviewer(lambda current: ReviewResult(current.review_id, current.head_sha, Verdict.APPROVED))).execute(request, implementation)
+        return _review_value(result)
+    finally:
+        directory.cleanup()
+
+
+def scenario_review_fix():
+    directory, repo, request, implementation = _review_fixture("sim-review-fix")
+    try:
+        finding = Finding("f-1", Severity.P1, "defect", "real defect", "src/result.txt", 1, "correctness", "fix it")
+        calls = []
+        def review(current):
+            calls.append(current)
+            return ReviewResult(current.review_id, current.head_sha, Verdict.CHANGES_REQUESTED, (finding,)) if len(calls) == 1 else ReviewResult(current.review_id, current.head_sha, Verdict.APPROVED)
+        def fixer(old, _):
+            (repo / "src" / "result.txt").write_text("fixed\n")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "fix"], cwd=repo, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
+            check = ("python3", "-c", "print('check')")
+            next_request = ReviewInputPreparer().prepare(review_id="sim-review-fix-2", run_id="sim-review-fix", repository=str(repo), objective="offline review", base_sha=request.base_sha, expected_head_sha=head, validation_evidence={"passed": True}, cycle=2)
+            cfg = RunnerConfig(run_id="sim-review-fix", repository=str(repo), source_sha=head, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation", validation_diff_digest=next_request.diff_digest)
+            run = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(cfg)
+            return run, next_request
+        return _review_value(ReviewFixLoop(FakeReviewer(review), max_cycles=2).execute(request, implementation, fixer))
+    finally:
+        directory.cleanup()
+
+
+def scenario_review_stale():
+    directory, repo, request, implementation = _review_fixture("sim-review-stale")
+    try:
+        def review(current):
+            (repo / "src" / "stale.txt").write_text("new head\n")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "stale"], cwd=repo, check=True)
+            return ReviewResult(current.review_id, current.head_sha, Verdict.APPROVED)
+        return _review_value(ReviewFixLoop(FakeReviewer(review)).execute(request, implementation))
+    finally:
+        directory.cleanup()
+
+
+def scenario_review_malformed():
+    directory, repo, request, implementation = _review_fixture("sim-review-malformed")
+    try:
+        bad = ReviewResult(request.review_id, request.head_sha, Verdict.CHANGES_REQUESTED)
+        return _review_value(ReviewFixLoop(FakeReviewer([bad])).execute(request, implementation))
+    finally:
+        directory.cleanup()
+
+
+def scenario_review_repeat():
+    directory, repo, request, implementation = _review_fixture("sim-review-repeat")
+    try:
+        finding = Finding("f-1", Severity.P1, "repeat", "repeat defect", "src/result.txt", 1, "correctness", "fix it")
+        def fixer(old, _):
+            (repo / "src" / "result.txt").write_text(f"progress {old.cycle}\n")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "progress"], cwd=repo, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
+            check = ("python3", "-c", "print('check')")
+            next_request = ReviewInputPreparer().prepare(review_id=f"sim-review-repeat-{old.cycle + 1}", run_id="sim-review-repeat", repository=str(repo), objective="offline review", base_sha=request.base_sha, expected_head_sha=head, validation_evidence={"passed": True}, cycle=old.cycle + 1)
+            run = BoundedRunner(FakeCodexAdapter(lambda _, __, commands: (commands.run(check), AdapterResult(0))[1])).run(RunnerConfig(run_id="sim-review-repeat", repository=str(repo), source_sha=head, allowed_paths=("src",), allowed_commands=(check,), required_checks=(check,), objective="offline implementation", validation_diff_digest=next_request.diff_digest))
+            return run, next_request
+        result = ReviewFixLoop(FakeReviewer(lambda current: ReviewResult(current.review_id, current.head_sha, Verdict.CHANGES_REQUESTED, (finding,))), max_cycles=3, repeat_threshold=2).execute(request, implementation, fixer)
+        return _review_value(result)
+    finally:
+        directory.cleanup()
+
+
+def scenario_review_human():
+    directory, repo, request, implementation = _review_fixture("sim-review-human")
+    try:
+        return _review_value(ReviewFixLoop(FakeReviewer([ReviewResult(request.review_id, request.head_sha, Verdict.HUMAN_DECISION_REQUIRED, summary="ambiguous", requires_human=True)])).execute(request, implementation))
+    finally:
+        directory.cleanup()
+
+
+def scenario_review_red():
+    directory, repo, request, implementation = _review_fixture("sim-review-red")
+    try:
+        return _review_value(ReviewFixLoop(FakeReviewer([ReviewResult(request.review_id, request.head_sha, Verdict.APPROVED, risk="red")])).execute(request, implementation))
+    finally:
+        directory.cleanup()
+
+
+def scenario_review_provider_failure():
+    directory, repo, request, implementation = _review_fixture("sim-review-provider")
+    try:
+        return _review_value(ReviewFixLoop(FakeReviewer(lambda _: (_ for _ in ()).throw(ProviderFailure("offline provider failure")))).execute(request, implementation))
+    finally:
+        directory.cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=["green", "amber-fix", "red-gate", "runner", "all"], default="all")
+    parser.add_argument("--scenario", choices=["green", "amber-fix", "red-gate", "review-clean", "review-fix", "review-stale", "review-malformed", "review-repeat", "review-human", "review-red", "review-provider-failure", "runner", "all"], default="all")
     args = parser.parse_args()
-    scenarios = {"green": scenario_green, "amber-fix": scenario_amber_fix, "red-gate": scenario_red_gate}
+    scenarios = {"green": scenario_green, "amber-fix": scenario_amber_fix, "red-gate": scenario_red_gate,
+                 "review-clean": scenario_review_clean, "review-fix": scenario_review_fix, "review-stale": scenario_review_stale,
+                 "review-malformed": scenario_review_malformed, "review-repeat": scenario_review_repeat, "review-human": scenario_review_human,
+                 "review-red": scenario_review_red, "review-provider-failure": scenario_review_provider_failure}
     if args.scenario in ("runner", "all"):
         scenarios.update({"runner-green": scenario_runner_green, "runner-failure": scenario_runner_failure,
                           "runner-timeout": scenario_runner_timeout, "runner-scope-violation": scenario_runner_scope_violation})
-    selected = scenarios.items() if args.scenario == "all" else [(args.scenario, scenarios[args.scenario])] if args.scenario in scenarios else [(name, scenarios[name]) for name in ("runner-green", "runner-failure", "runner-timeout", "runner-scope-violation")]
+    if args.scenario == "all":
+        selected = scenarios.items()
+    elif args.scenario in scenarios:
+        selected = [(args.scenario, scenarios[args.scenario])]
+    else:
+        selected = [(name, scenarios[name]) for name in ("runner-green", "runner-failure", "runner-timeout", "runner-scope-violation")]
     results = {}
     for name, fn in selected:
         value = fn()
-        results[name] = value.snapshot.to_dict() if hasattr(value, "snapshot") else value.to_dict()
+        results[name] = value.snapshot.to_dict() if hasattr(value, "snapshot") else value.to_dict() if hasattr(value, "to_dict") else value
     print(json.dumps(results, indent=2))
 
 
