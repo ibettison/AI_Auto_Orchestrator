@@ -1,6 +1,8 @@
-# AI Auto Orchestrator — Slice B
+# AI Auto Orchestrator — Slice C
 
-Slice B adds a bounded, unattended development runner around the merged Slice A coordination contract. It proves that a fake Codex adapter can work on an exact immutable Git SHA in a clean temporary clone, execute only explicit argv commands, and return a structured result that can drive `IMPLEMENTED` or fail-closed `RUNNER_FAILED` events.
+Slice C adds an independent, SHA-bound reviewer and bounded review/fix loop around the Slice A contract and Slice B runner. The offline MVP architecture is:
+
+`Objective → bounded Codex runner → validation → immutable diff → independent reviewer → bounded fix/re-review loop → AI approved OR human decision required`
 
 ## Run offline
 
@@ -33,6 +35,14 @@ The command and path policies are intentionally fail closed. They are policy che
 
 `--scenario all` includes Slice A GREEN/AMBER/RED paths plus Slice B runner GREEN, command failure, timeout/process termination, and out-of-scope modification scenarios. Each runner scenario uses a throwaway local repository and cleans it up.
 
+## Slice C reviewer boundary
+
+`ReviewInputPreparer` resolves exact Git base and head commits and binds the actual untruncated `base...head` diff to a SHA-256 digest. `ReviewRequest` carries the objective, repository, both SHAs, diff, validation evidence, risk context, and cycle. `ReviewResult` uses bounded verdict/severity enums and is validated before it can affect the state machine. An approval for one head is never valid for another; a changed head during review is escalated.
+
+`ReviewFixLoop` uses the deterministic Slice A reducer, records durable-review-shaped events through `FakeGitHubCoordinator`, limits cycles, fingerprints equivalent findings, and escalates repeated findings, malformed results, provider failures, ambiguous decisions, and RED risk. Repository/diff text is explicitly untrusted data. The `OpenAIResponsesReviewer` is only a structural Responses API boundary using JSON Schema, `store=false`, configured model/limits, and no tools; it has no default transport and no live call is made in this repository.
+
+Slice C does not authorise production execution. It does not connect to LayMatched, OpenAI, GitHub mutation APIs, credentials, Stripe, email, DNS, databases, webhooks, CI, or external providers. Production deployment would still require a durable external orchestrator/bridge, separated GitHub App/token identities, secret management, hard network/container isolation, real provider credentials, persistence/durable leases, monitoring, and an explicit production approval path. This repository alone cannot wake or control an existing ChatGPT conversation.
+
 ## Deliberate limitations
 
-Slice B does not authorise production execution. It does not connect to LayMatched, OpenAI APIs, Codex services, Stripe, email, DNS, databases, webhooks, CI, or any external provider. It does not implement autonomous merging, sophisticated container resource isolation, durable leases, persisted audit logs, or a real Codex CLI adapter. Those require later slices and explicit OS/container controls.
+Slice C is the final offline MVP slice, not a production executor. It does not implement autonomous merging, sophisticated container resource isolation, durable leases, persisted audit logs, live OpenAI calls, live GitHub mutation, or a real Codex CLI adapter. Oversized review input is rejected rather than silently chunked. Those capabilities require explicit deployment controls and a separate activation decision.

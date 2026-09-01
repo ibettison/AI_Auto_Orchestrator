@@ -507,16 +507,18 @@ class BoundedRunner:
         deadline = time.monotonic() + config.timeout_seconds
         try:
             payload: dict[str, object] | None = None
+            pipe_closed = False
             while process.is_alive() and payload is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                if receiver.poll(min(0.05, remaining)):
+                if pipe_closed:
+                    process.join(min(0.01, remaining))
+                elif receiver.poll(min(0.05, remaining)):
                     try:
                         payload = receiver.recv()
                     except EOFError:
-                        payload = None
-                        break
+                        pipe_closed = True
                 else:
                     process.join(min(0.01, remaining))
             while payload is not None and process.is_alive():
