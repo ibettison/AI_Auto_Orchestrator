@@ -35,6 +35,16 @@ class SliceBTests(unittest.TestCase):
         (self.repo / "src" / "README.txt").write_text("clean\n")
         (self.repo / "docs").mkdir()
         (self.repo / "docs" / "README.txt").write_text("docs\n")
+        (self.repo / "tools").mkdir()
+        (self.repo / "tools" / "long_command.py").write_text(
+            "import os\n"
+            "import pathlib\n"
+            "import time\n"
+            "marker = pathlib.Path(os.environ['SLICE_B_MARKER'])\n"
+            "marker.with_name('started').write_text('started')\n"
+            "time.sleep(2)\n"
+            "marker.with_name('finished').write_text('finished')\n"
+        )
         self.git(["add", "."])
         self.git(["commit", "-qm", "initial"])
         self.sha = self.git(["rev-parse", "HEAD"]).strip()
@@ -147,6 +157,56 @@ class SliceBTests(unittest.TestCase):
         self.assertEqual(failed_command.status, "failed")
         self.assertEqual(failed_command.commands_executed[0].status, "non_zero_exit")
         self.assertIn("command failed", failed_command.failure_reason)
+
+    def test_overall_timeout_terminates_active_command_process_group(self):
+        marker = Path(self.temp.name) / "marker"
+        long_command = ("python3", "tools/long_command.py")
+
+        def action(_, __, commands):
+            commands.run(long_command)
+            return AdapterResult(0)
+
+        result = BoundedRunner(FakeCodexAdapter(action)).run(self.config(
+            run_id="active-command-timeout",
+            allowed_commands=(long_command,),
+            required_checks=(long_command,),
+            environment={"SLICE_B_MARKER": str(marker)},
+            timeout_seconds=0.2,
+            command_timeout_seconds=5,
+        ))
+        self.assertEqual(result.status, "timed_out")
+        self.assertTrue((marker.parent / "started").exists())
+        time.sleep(0.3)
+        self.assertFalse((marker.parent / "finished").exists())
+
+    def test_large_valid_adapter_payload_does_not_deadlock_ipc(self):
+        payload = "x" * (96 * 1024)
+        check = ("python3", "-c", "print('check')")
+
+        def action(_, __, commands):
+            commands.run(check)
+            return AdapterResult(0, payload)
+
+        result = BoundedRunner(FakeCodexAdapter(action)).run(self.config(max_output_size=128 * 1024))
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(result.stdout_summary), len(payload))
+
+    def test_aggregate_command_and_adapter_output_limit_is_enforced(self):
+        noisy_command = ("python3", "-c", "print('x' * 40960)")
+
+        def action(_, __, commands):
+            commands.run(noisy_command)
+            return AdapterResult(0, "y" * 40960)
+
+        result = BoundedRunner(FakeCodexAdapter(action)).run(self.config(
+            run_id="aggregate-output-limit",
+            allowed_commands=(noisy_command,),
+            required_checks=(noisy_command,),
+            max_output_size=64 * 1024,
+        ))
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(result.validation_passed)
+        self.assertIn("output", result.failure_reason)
 
     def test_environment_is_allowlisted_and_network_is_denied(self):
         os.environ["SLICE_B_TEST_SECRET"] = "must-not-leak"

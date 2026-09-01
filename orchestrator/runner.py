@@ -194,6 +194,7 @@ class BoundedCommandRunner:
         self.audit = audit
         self.results: list[CommandResult] = []
         self.captured_output = 0
+        self.active_process: subprocess.Popen[bytes] | None = None
 
     @staticmethod
     def _terminate(process: subprocess.Popen[bytes]) -> None:
@@ -210,6 +211,11 @@ class BoundedCommandRunner:
             except subprocess.TimeoutExpired:
                 pass
 
+    def terminate_active(self) -> None:
+        process = self.active_process
+        if process is not None and process.poll() is None:
+            self._terminate(process)
+
     def run(self, argv: Sequence[str]) -> CommandResult:
         command = self.policy.authorize(argv)
         remaining = self.overall_deadline - time.monotonic()
@@ -219,6 +225,7 @@ class BoundedCommandRunner:
         self.audit.append({"action": "command_attempted", "command": " ".join(command), "at": _now()})
         process = subprocess.Popen(command, cwd=self.workspace, env=self.environment, shell=False,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        self.active_process = process
         record_index = len(self.results)
         self.results.append(CommandResult(command, None, "", "", 0.0, "running"))
         selector = selectors.DefaultSelector()
@@ -255,6 +262,7 @@ class BoundedCommandRunner:
             for stream in (process.stdout, process.stderr):
                 if stream and not stream.closed:
                     stream.close()
+            self.active_process = None
         stdout, stderr = bytes(buffers["stdout"]), bytes(buffers["stderr"])
         result = CommandResult(command, process.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace"), time.monotonic() - started, "completed" if process.returncode == 0 else "non_zero_exit", None if process.returncode == 0 else f"exit code {process.returncode}")
         self.results[record_index] = result
@@ -303,13 +311,18 @@ def _adapter_worker(adapter: CodexAdapter, objective: str, workspace: str, confi
     os.environ.update(EnvironmentPolicy(config.environment).build())
     audit: list[dict[str, str]] = []
     command_runner = BoundedCommandRunner(Path(workspace), CommandPolicy(config.allowed_commands, config.max_commands), os.environ, config.command_timeout_seconds, time.monotonic() + config.timeout_seconds, config.max_output_size, audit)
+    def terminate_child_command(signum, _frame):
+        command_runner.terminate_active()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate_child_command)
     try:
         result = adapter.run(objective, Path(workspace), command_runner)
         if not isinstance(result, AdapterResult):
             raise TypeError("adapter must return AdapterResult")
         stdout = _sanitized(result.stdout, config.max_output_size)
         stderr = _sanitized(result.stderr, config.max_output_size)
-        output_exceeded = len(str(result.stdout).encode()) + len(str(result.stderr).encode()) > config.max_output_size
+        output_exceeded = command_runner.captured_output + len(str(result.stdout).encode()) + len(str(result.stderr).encode()) > config.max_output_size
         connection.send({"kind": "result", "exit_code": result.exit_code, "stdout": stdout, "stderr": stderr,
                          "failure_reason": _sanitized(result.failure_reason) if result.failure_reason else None,
                          "commands": [item.to_dict() for item in command_runner.results], "audit": audit,
@@ -493,7 +506,24 @@ class BoundedRunner:
         sender.close()
         deadline = time.monotonic() + config.timeout_seconds
         try:
-            process.join(max(0.0, deadline - time.monotonic()))
+            payload: dict[str, object] | None = None
+            while process.is_alive() and payload is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if receiver.poll(min(0.05, remaining)):
+                    try:
+                        payload = receiver.recv()
+                    except EOFError:
+                        payload = None
+                        break
+                else:
+                    process.join(min(0.01, remaining))
+            while payload is not None and process.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                process.join(min(0.01, remaining))
         except KeyboardInterrupt:
             self._terminate_adapter(process)
             audit.append({"action": "adapter_interrupted", "at": _now()})
@@ -505,10 +535,11 @@ class BoundedRunner:
             receiver.close()
             process.close()
             return ({"kind": "timed_out", "failure_reason": "adapter overall timeout"}, ())
-        try:
-            payload: dict[str, object] | None = receiver.recv() if receiver.poll(0.1) else None
-        except EOFError:
-            payload = None
+        if payload is None:
+            try:
+                payload = receiver.recv() if receiver.poll(0.1) else None
+            except EOFError:
+                payload = None
         exitcode = process.exitcode
         receiver.close()
         process.close()
