@@ -7,8 +7,8 @@ def classify(*, tests_pass: bool = True, scope_changed: bool = False,
              destructive: bool = False, external_side_effect: bool = False,
              human_approved: bool = False) -> Risk:
     if destructive or external_side_effect:
-        return Risk.RED if not human_approved else Risk.AMBER
+        # Approval is a state-machine event, never an untrusted payload flag.
+        return Risk.RED
     if not tests_pass or scope_changed:
         return Risk.AMBER
     return Risk.GREEN
-

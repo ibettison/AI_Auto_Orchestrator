@@ -6,9 +6,9 @@ This repository is an independent, offline reference implementation for coordina
 
 Events are append-only JSON-compatible records containing `event_id`, `event_type`, `run_id`, `sequence`, `expected_version`, `source_sha`, `idempotency_key`, and `payload`. A snapshot is derived only by applying valid events. `expected_version` provides optimistic concurrency; `sequence`, `source_sha`, and `run_id` reject stale or misrouted events. Repeating an event ID or idempotency key is a no-op.
 
-States are `planned → implementing → reviewing → complete`, with `waiting_human → fixing → reviewing`, and explicit `blocked/recovery` paths. Review findings consume a bounded cycle budget (default two). Human decisions are mandatory for fixes after findings and for RED actions.
+States are `planned → implementing → reviewing → complete`, with ordinary findings taking an automatic `fixing → reviewing` loop. RED conditions and exhausted review budgets enter `human_decision_required`; explicit `blocked/recovery` paths are fail-closed. Review findings consume a bounded cycle budget (default two). Human decisions support `approve_fix`, `approve_red_action`, and `stop`; generic fix approval cannot satisfy a RED gate.
 
-Risk is deterministic: GREEN means tests pass with no scope or external side effect; AMBER means test/scope uncertainty or a human-approved fix; RED means destructive/external side effects without approval, or an explicit human stop.
+Risk is deterministic: GREEN means tests pass with no scope or external side effect; AMBER means test/scope uncertainty or a human-approved fix; RED means destructive/external side effects without approval, or an explicit human stop. RED is carried durably in the snapshot until `approve_red_action` is applied.
 
 ## Run it offline
 

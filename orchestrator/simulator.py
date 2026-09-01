@@ -19,7 +19,7 @@ def scenario_green():
 
 def scenario_amber_fix():
     o = Orchestrator("amber", "sha-demo")
-    seq = [(EventType.START, {}), (EventType.IMPLEMENTED, {"scope_changed": True}), (EventType.REVIEW_FINDINGS, {"findings": ["missing test"]}), (EventType.HUMAN_DECISION, {"decision": "approve_fix", "human_approved": True}), (EventType.FIX_APPLIED, {"tests_pass": True}), (EventType.REVIEW_PASSED, {"tests_pass": True})]
+    seq = [(EventType.START, {}), (EventType.IMPLEMENTED, {"scope_changed": True}), (EventType.REVIEW_FINDINGS, {"findings": ["missing test"]}), (EventType.FIX_APPLIED, {"tests_pass": True}), (EventType.REVIEW_PASSED, {"tests_pass": True})]
     for n, (typ, payload) in enumerate(seq, 1):
         o.apply(event("amber", n, typ, n - 1, **payload))
     return o
@@ -43,4 +43,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
