@@ -12,6 +12,7 @@ from orchestrator.reviewer import (
     FakeReviewer,
     OpenAIResponsesReviewer,
     ProviderFailure,
+    REVIEW_JSON_SCHEMA,
     ReviewError,
     ReviewFixLoop,
     ReviewInputPreparer,
@@ -52,11 +53,11 @@ class SliceCTests(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", text)
 
-    def request(self, head=None, cycle=1, max_diff_bytes=256 * 1024):
+    def request(self, head=None, cycle=1, max_diff_bytes=256 * 1024, risk="green"):
         head = head or self.head
         return ReviewInputPreparer(max_diff_bytes).prepare(
             review_id=f"review-{cycle}-{head[:8]}", run_id="slice-c-run", repository=str(self.repo), objective="make a harmless bounded change",
-            base_sha=self.base, expected_head_sha=head, validation_evidence={"passed": True}, cycle=cycle,
+            base_sha=self.base, expected_head_sha=head, validation_evidence={"passed": True}, cycle=cycle, risk=risk,
         )
 
     def implementation(self, source_sha=None):
@@ -142,6 +143,12 @@ class SliceCTests(unittest.TestCase):
         result = ReviewFixLoop(FakeReviewer([red])).execute(request, self.implementation())
         self.assertEqual(result.state, State.HUMAN_DECISION_REQUIRED)
 
+    def test_request_red_risk_cannot_be_downgraded_by_reviewer(self):
+        request = self.request(risk="red")
+        green = ReviewResult(request.review_id, request.head_sha, Verdict.APPROVED, risk="green")
+        result = ReviewFixLoop(FakeReviewer([green])).execute(request, self.implementation())
+        self.assertEqual(result.state, State.HUMAN_DECISION_REQUIRED)
+
     def test_scenario_h_provider_failure_fails_closed(self):
         request = self.request()
         result = ReviewFixLoop(FakeReviewer(lambda _: (_ for _ in ()).throw(ProviderFailure("provider unavailable")))).execute(request, self.implementation())
@@ -174,11 +181,15 @@ class SliceCTests(unittest.TestCase):
         captured = {}
         def transport(body, timeout):
             captured.update(body=body, timeout=timeout)
-            return {"structured_output": {"review_id": request.review_id, "reviewed_head_sha": request.head_sha, "verdict": "approved", "findings": [], "summary": "ok", "risk": "green", "requires_human": False}}
+            return {"status": "completed", "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}, "structured_output": {"review_id": request.review_id, "reviewed_head_sha": request.head_sha, "verdict": "approved", "findings": [], "summary": "ok", "risk": "green", "requires_human": False}}
         result = OpenAIResponsesReviewer("configured-model", transport=transport).review(request)
         self.assertEqual(result.verdict, Verdict.APPROVED)
         self.assertEqual((captured["body"]["store"], captured["body"]["text"]["format"]["type"]), (False, "json_schema"))
         self.assertIn(request.head_sha, captured["body"]["input"][1]["content"])
+        self.assertEqual(result.provider_metadata["usage"]["total_tokens"], 20)
+
+        with self.assertRaises(ProviderFailure):
+            OpenAIResponsesReviewer("configured-model", transport=lambda *_: {"status": "incomplete"}).review(request)
 
         malformed = OpenAIResponsesReviewer("configured-model", transport=lambda *_: {"structured_output": {"verdict": "approved"}})
         with self.assertRaises(ProviderFailure):
@@ -197,6 +208,13 @@ class SliceCTests(unittest.TestCase):
         wrong = ReviewResult(request.review_id, "0" * 40, Verdict.APPROVED)
         with self.assertRaises(ReviewError):
             wrong.validate_against(request)
+
+    def test_provider_schema_defines_bounded_finding_object(self):
+        findings = REVIEW_JSON_SCHEMA["properties"]["findings"]
+        item = findings["items"]
+        self.assertEqual((findings["maxItems"], item["additionalProperties"]), (100, False))
+        self.assertIn("remediation", item["required"])
+        self.assertEqual(item["properties"]["severity"]["enum"], ["P0", "P1", "P2", "P3"])
 
 
 if __name__ == "__main__":

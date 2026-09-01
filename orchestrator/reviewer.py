@@ -165,7 +165,10 @@ class ReviewInputPreparer:
         actual_head = self._git(repo, "rev-parse", "--verify", "HEAD").strip()
         if actual_base.lower() != base_sha.lower() or actual_head.lower() != expected_head_sha.lower() or actual_base == actual_head:
             raise ReviewError("base/head SHA is stale or unresolved")
-        diff_bytes = subprocess.run(["git", "diff", "--binary", f"{actual_base}...{actual_head}"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False).stdout
+        diff_result = subprocess.run(["git", "diff", "--binary", f"{actual_base}...{actual_head}"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if diff_result.returncode:
+            raise ReviewError("git diff could not be resolved")
+        diff_bytes = diff_result.stdout
         if not diff_bytes or len(diff_bytes) > self.max_diff_bytes:
             raise ReviewError("review diff is empty or exceeds configured limit")
         diff = diff_bytes.decode(errors="replace")
@@ -200,7 +203,20 @@ REVIEW_JSON_SCHEMA = {
         "review_id": {"type": "string"}, "reviewed_head_sha": {"type": "string"},
         "verdict": {"enum": [v.value for v in Verdict]}, "summary": {"type": "string"},
         "risk": {"enum": ["green", "amber", "red"]}, "requires_human": {"type": "boolean"},
-        "findings": {"type": "array", "items": {"type": "object"}},
+        "findings": {"type": "array", "maxItems": 100, "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["finding_id", "severity", "title", "description", "path", "line", "category", "remediation"],
+            "properties": {
+                "finding_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "severity": {"enum": [s.value for s in Severity]},
+                "title": {"type": "string", "minLength": 1, "maxLength": 512},
+                "description": {"type": "string", "minLength": 1, "maxLength": _MAX_TEXT},
+                "path": {"anyOf": [{"type": "string", "maxLength": 1024}, {"type": "null"}]},
+                "line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+                "category": {"type": "string", "minLength": 1, "maxLength": 128},
+                "remediation": {"type": "string", "minLength": 1, "maxLength": _MAX_TEXT},
+            },
+        }},
     },
 }
 
@@ -225,11 +241,24 @@ class OpenAIResponsesReviewer:
             raw = self.transport(body, self.timeout_seconds)
             if time.monotonic() - started > self.timeout_seconds:
                 raise ProviderFailure("reviewer request timeout")
+            if not isinstance(raw, Mapping) or raw.get("status") != "completed":
+                raise ProviderFailure("provider response was not completed")
             value = raw.get("structured_output") if isinstance(raw, Mapping) else None
             if not isinstance(value, Mapping):
                 raise ProviderFailure("provider returned no structured output")
             findings = tuple(Finding(f["finding_id"], Severity(f["severity"]), f["title"], f["description"], f.get("path"), f.get("line"), f.get("category", "correctness"), f["remediation"]) for f in value.get("findings", []))
-            result = ReviewResult(value["review_id"], value["reviewed_head_sha"], Verdict(value["verdict"]), findings, _bounded(value.get("summary", "")), value.get("risk", "green"), value.get("requires_human", False), {"model": self.model, "store": False})
+            usage = raw.get("usage", {})
+            if usage is None:
+                usage = {}
+            if not isinstance(usage, Mapping):
+                raise ProviderFailure("provider usage metadata was malformed")
+            bounded_usage = {}
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                if key in usage:
+                    if not isinstance(usage[key], int) or not 0 <= usage[key] <= 10_000_000:
+                        raise ProviderFailure("provider usage metadata exceeded bounds")
+                    bounded_usage[key] = usage[key]
+            result = ReviewResult(value["review_id"], value["reviewed_head_sha"], Verdict(value["verdict"]), findings, _bounded(value.get("summary", "")), value.get("risk", "green"), value.get("requires_human", False), {"model": self.model, "store": False, "status": "completed", "usage": bounded_usage})
             result.validate_against(request)
             return result
         except ReviewError:
@@ -293,6 +322,7 @@ class ReviewFixLoop:
         results: list[ReviewResult] = []
         seen_fingerprints: dict[str, int] = {}
         current = request
+        effective_risk = request.risk
         for cycle in range(1, self.max_cycles + 1):
             if self.current_head(current.repository).lower() != current.head_sha.lower():
                 return self._human(machine, current, results, "head changed before review")
@@ -307,10 +337,14 @@ class ReviewFixLoop:
             if self.current_head(current.repository).lower() != current.head_sha.lower():
                 return self._human(machine, current, results, "head changed during review")
             results.append(review)
+            if "red" in (effective_risk, review.risk):
+                effective_risk = "red"
+            elif "amber" in (effective_risk, review.risk):
+                effective_risk = "amber"
             fps = tuple(f.fingerprint() for f in review.findings)
             if review.verdict == Verdict.APPROVED:
                 self.github.record(DurableReviewRecord("AI_APPROVED", current.run_id, current.review_id, cycle, current.head_sha, review.verdict.value, fps))
-                machine.apply(_event(current, machine.snapshot.version + 1, EventType.REVIEW_PASSED, tests_pass=True, reviewed_head_sha=current.head_sha, destructive=review.risk == "red"))
+                machine.apply(_event(current, machine.snapshot.version + 1, EventType.REVIEW_PASSED, tests_pass=True, reviewed_head_sha=current.head_sha, destructive=effective_risk == "red"))
                 return LoopResult(machine.snapshot.state, tuple(results), tuple(self.github.records))
             if review.verdict == Verdict.HUMAN_DECISION_REQUIRED:
                 return self._human(machine, current, results, review.summary)
@@ -319,7 +353,7 @@ class ReviewFixLoop:
                 seen_fingerprints[fingerprint] = seen_fingerprints.get(fingerprint, 0) + 1
             if review.verdict != Verdict.CHANGES_REQUESTED or not fixer or cycle >= self.max_cycles or any(seen_fingerprints[fp] >= self.repeat_threshold for fp in fps):
                 return self._human(machine, current, results, "review/fix bound or repeated finding reached")
-            machine.apply(_event(current, machine.snapshot.version + 1, EventType.REVIEW_FINDINGS, findings=list(fps)))
+            machine.apply(_event(current, machine.snapshot.version + 1, EventType.REVIEW_FINDINGS, findings=list(fps), destructive=effective_risk == "red"))
             try:
                 fixed, next_request = fixer(current, review)
                 next_request.validate()
