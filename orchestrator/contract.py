@@ -2,7 +2,36 @@
 
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Mapping
+
+
+class FrozenDict(dict):
+    """A dict-shaped immutable value that remains easy to serialize."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("event payload is immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _immutable
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return FrozenDict({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze(item) for item in value)
+    return value
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return [_json_value(item) for item in value]
+    return value
 
 
 class State(StrEnum):
@@ -45,13 +74,26 @@ class Event:
     expected_version: int
     source_sha: str
     idempotency_key: str
-    payload: dict[str, Any] = field(default_factory=dict)
+    payload: Mapping[str, Any] = field(default_factory=dict)
     schema: str = "loop/v1"
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload, Mapping):
+            raise ValueError("payload must be an object")
+        object.__setattr__(self, "payload", _freeze(self.payload))
+
     def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        value["event_type"] = self.event_type.value
-        return value
+        return {
+            "event_id": self.event_id,
+            "event_type": self.event_type.value,
+            "run_id": self.run_id,
+            "sequence": self.sequence,
+            "expected_version": self.expected_version,
+            "source_sha": self.source_sha,
+            "idempotency_key": self.idempotency_key,
+            "payload": _json_value(self.payload),
+            "schema": self.schema,
+        }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "Event":
@@ -83,7 +125,7 @@ class Event:
             raise ValueError("sequence must be a positive integer")
         if not isinstance(self.expected_version, int) or self.expected_version < 0:
             raise ValueError("expected_version must be a non-negative integer")
-        if not isinstance(self.payload, dict):
+        if not isinstance(self.payload, Mapping):
             raise ValueError("payload must be an object")
 
 

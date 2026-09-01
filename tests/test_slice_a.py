@@ -44,6 +44,23 @@ class SliceATests(unittest.TestCase):
         self.assertEqual(o.apply(e), o.snapshot)
         self.assertEqual(o.snapshot.version, 1)
 
+    def test_event_payload_is_immutable_and_replay_stays_deterministic(self):
+        payload = {"findings": ["one"], "metadata": {"owner": "review"}}
+        o = Orchestrator("r", "sha")
+        start = event("r", 1, EventType.START, 0, sha="sha")
+        o.apply(start)
+        findings = event("r", 2, EventType.IMPLEMENTED, 1, sha="sha", **payload)
+        o.apply(findings)
+        payload["findings"].append("mutated caller input")
+        payload["metadata"]["owner"] = "mutated caller input"
+        with self.assertRaises(TypeError):
+            findings.payload["findings"] = ("changed",)
+        with self.assertRaises(TypeError):
+            findings.payload["findings"] += ("changed",)
+        self.assertEqual(findings.to_dict()["payload"], {"findings": ["one"], "metadata": {"owner": "review"}})
+        replayed = Orchestrator("r", "sha").replay(o.events)
+        self.assertEqual(replayed, o.snapshot)
+
     def test_conflicting_event_id_and_key_fail_closed(self):
         o = Orchestrator("r", "sha")
         first = event("r", 1, EventType.START, 0, sha="sha", key="same")
