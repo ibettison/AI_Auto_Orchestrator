@@ -1,0 +1,11 @@
+{
+  "profile": "laymatched-example",
+  "description": "Offline illustrative profile; no LayMatched integration",
+  "source_sha": "sha256:example-input",
+  "scope": "documentation-only change",
+  "risk": "green",
+  "max_review_cycles": 2,
+  "human_gate": true,
+  "providers": []
+}
+
