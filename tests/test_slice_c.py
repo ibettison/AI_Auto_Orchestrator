@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 import subprocess
 import tempfile
 import traceback
@@ -16,6 +17,7 @@ from orchestrator.reviewer import (
     OpenAIResponsesReviewer,
     ProviderFailure,
     REVIEW_JSON_SCHEMA,
+    ReviewAuditLog,
     ReviewError,
     ReviewFixLoop,
     ReviewInputPreparer,
@@ -85,6 +87,39 @@ class SliceCTests(unittest.TestCase):
         self.assertEqual(result.state, State.COMPLETE)
         self.assertEqual(result.review_results[0].verdict, Verdict.APPROVED)
         self.assertEqual(result.records[-1].event, "AI_APPROVED")
+
+    def test_review_audit_log_appends_complete_sha_bound_results(self):
+        request = self.request()
+        finding = self.finding_result(request).findings[0]
+        result = ReviewResult(
+            request.review_id, request.head_sha, Verdict.CHANGES_REQUESTED,
+            (finding,), "fix required", provider_metadata={"model": "review-model"},
+        )
+        path = Path(self.temp.name) / "reviews.jsonl"
+
+        log = ReviewAuditLog(path.resolve())
+        log.append(request, result)
+        log.append(request, result)
+
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["schema_version"], 1)
+        self.assertEqual(records[0]["diff_digest"], request.diff_digest)
+        self.assertEqual(records[0]["reviewed_head_sha"], request.head_sha)
+        self.assertEqual(records[0]["findings"][0]["finding_id"], finding.finding_id)
+        self.assertEqual(records[0]["provider_metadata"], {"model": "review-model"})
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_review_audit_log_rejects_relative_path_and_symlink(self):
+        with self.assertRaises(ReviewError):
+            ReviewAuditLog(Path("reviews.jsonl"))
+        target = Path(self.temp.name) / "target.jsonl"
+        target.touch()
+        link = Path(self.temp.name) / "reviews.jsonl"
+        link.symlink_to(target)
+        with self.assertRaises(ReviewError):
+            request = self.request()
+            ReviewAuditLog(link.absolute()).append(request, self.approved(request))
 
     def test_scenario_b_one_fix_then_review_new_head(self):
         request = self.request()

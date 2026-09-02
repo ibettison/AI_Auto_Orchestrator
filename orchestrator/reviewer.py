@@ -11,12 +11,16 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
+
+import fcntl
 
 from .contract import EventType, State
 from .runner import RunnerResult
@@ -144,6 +148,78 @@ class ReviewResult:
             raise ReviewError("human verdict must require a human")
         if self.verdict == Verdict.REVIEW_FAILED:
             raise ReviewError("review failure is not an approval")
+
+
+class ReviewAuditLog:
+    """Append validated review results to a credential-free local JSONL log."""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        if not self.path.is_absolute():
+            raise ReviewError("review audit log path must be absolute")
+
+    def append(self, request: ReviewRequest, result: ReviewResult) -> None:
+        result.validate_against(request)
+        record = {
+            "schema_version": self.SCHEMA_VERSION,
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "run_id": request.run_id,
+            "review_id": result.review_id,
+            "cycle": request.cycle,
+            "base_sha": request.base_sha,
+            "reviewed_head_sha": result.reviewed_head_sha,
+            "diff_digest": request.diff_digest,
+            "verdict": result.verdict.value,
+            "risk": result.risk,
+            "requires_human": result.requires_human,
+            "summary": result.summary,
+            "findings": [
+                {
+                    "finding_id": finding.finding_id,
+                    "severity": finding.severity.value,
+                    "title": finding.title,
+                    "description": finding.description,
+                    "path": finding.path,
+                    "line": finding.line,
+                    "category": finding.category,
+                    "remediation": finding.remediation,
+                    "fingerprint": finding.fingerprint(),
+                }
+                for finding in result.findings
+            ],
+            "provider_metadata": dict(result.provider_metadata),
+        }
+        try:
+            encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        except (TypeError, ValueError):
+            raise ReviewError("review audit record is not JSON serializable") from None
+
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except OSError:
+            raise ReviewError("review audit log could not be opened safely") from None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ReviewError("review audit log must be a regular file with one link")
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written < 1:
+                    raise ReviewError("review audit record could not be written")
+                view = view[written:]
+            os.fsync(descriptor)
+        except OSError:
+            raise ReviewError("review audit record could not be persisted") from None
+        finally:
+            os.close(descriptor)
 
 
 class ReviewInputPreparer:

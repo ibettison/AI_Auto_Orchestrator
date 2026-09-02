@@ -19,7 +19,7 @@ orchestrator-run-objective \
 
 The runner requires the source checkout to be clean, fetches the configured base branch, creates an isolated clone and run branch, invokes the official `openai-codex` SDK in `workspace_write`, runs only exact profile-allowlisted checks, commits only allowed paths, pushes, and opens a PR. The SDK package includes its pinned Codex runtime, so a separately installed global Codex CLI is not required. If `OPENAI_API_KEY` is used, it is supplied through the SDK login method and removed before the agent turn; it is not inherited by commands in the Codex workspace.
 
-Each run has a `0700` state directory, exclusive filesystem lease, append-only `0600` JSONL journal, and atomic terminal result. An incomplete prior run and a reused terminal run ID both fail closed. Review comments identify the exact reviewed head and cycle on the PR. Any stale/changed head, invalid review, failed check, out-of-scope edit, symlink, repeated finding, RED risk, timeout, provider failure, or exhausted cycle enters `human_decision_required`. Approval enters `human_merge_approval_required`; it does not merge.
+Each run has a `0700` state directory, exclusive filesystem lease, append-only `0600` JSONL journal, atomic terminal result, and a persistent `reviews.jsonl` audit log. Every validated AI result is fsynced before it can affect the run, with its review/run identity, exact base and reviewed head SHAs, diff digest, verdict, risk, summary, findings and fingerprints, and bounded provider metadata. The objective and diff are deliberately excluded. An incomplete prior run and a reused terminal run ID both fail closed. Review comments identify the exact reviewed head and cycle on the PR. Any stale/changed head, invalid review, audit persistence failure, failed check, out-of-scope edit, symlink, repeated finding, RED risk, timeout, provider failure, or exhausted cycle enters `human_decision_required`. Approval enters `human_merge_approval_required`; it does not merge.
 
 ## Run offline
 
@@ -112,7 +112,7 @@ OPENAI_REVIEWER_TIMEOUT_SECONDS='30' \
 python3 -m orchestrator.live_review --request-json /secure/path/review-request.json
 ```
 
-The command performs one review only. It does not run commands, expose tools to the reviewer, mutate GitHub, merge, deploy, or automatically apply fixes. On any failure it prints only `live review failed closed`; it never prints the API key.
+The command performs one review only and appends the validated result to `/secure/path/review-request-reviews.jsonl` by default. Use `--audit-log /secure/path/reviews.jsonl` to select another existing directory. Audit files are append-only JSONL at mode `0600`; unsafe symlinks/hardlinks and persistence errors fail closed. It does not run commands, expose tools to the reviewer, mutate GitHub, merge, deploy, or automatically apply fixes. On any failure it prints only `live review failed closed`; it never prints the API key.
 
 Slice C does not authorise production execution. It does not connect to LayMatched, OpenAI, GitHub mutation APIs, credentials, Stripe, email, DNS, databases, webhooks, CI, or external providers. Production deployment would still require a durable external orchestrator/bridge, separated GitHub App/token identities, secret management, hard network/container isolation, real provider credentials, persistence/durable leases, monitoring, and an explicit production approval path. This repository alone cannot wake or control an existing ChatGPT conversation.
 

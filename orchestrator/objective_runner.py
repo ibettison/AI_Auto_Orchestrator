@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
-from .reviewer import OpenAIResponsesReviewer, ReviewInputPreparer, ReviewResult, Severity, Verdict
+from .reviewer import OpenAIResponsesReviewer, ReviewAuditLog, ReviewInputPreparer, ReviewResult, Severity, Verdict
 from .runner import BoundedCommandRunner, CommandPolicy, PathPolicy
 
 
@@ -525,6 +525,7 @@ class ObjectiveRunner:
                 try:
                     review = self.reviewer.review(request)
                     review.validate_against(request)
+                    ReviewAuditLog((run.run_dir / "reviews.jsonl").resolve()).append(request, review)
                 except Exception:
                     return self._terminal(run, "human_decision_required", "independent review failed closed", run_id, branch, pr_number, pr_url, head_sha, cycle)
                 if self.github.head_sha(workspace, profile.repository, pr_number) != head_sha:
