@@ -51,7 +51,7 @@ export OPENAI_REVIEWER_MODEL='your-approved-model-id'
 export OPENAI_REVIEWER_TIMEOUT_SECONDS='30'
 ```
 
-Set these in the AWS orchestration host's runtime secret/configuration mechanism. Do not put the API key in Git, a request JSON file, command arguments, logs, or durable review metadata. The SDK call is made with `store=false`, the existing strict JSON Schema, no `tools` field, and `max_output_tokens=2048`. Missing configuration, SDK/provider errors, timeouts, incomplete responses, malformed JSON, schema/identity mismatches, and validation errors fail closed into the existing human-decision path.
+Set these in the AWS orchestration host's runtime secret/configuration mechanism. `OPENAI_REVIEWER_TIMEOUT_SECONDS` must be greater than 0 and no more than 120 seconds; the upper bound prevents a configuration typo from creating an effectively unbounded orchestration wait. Do not put the API key in Git, a request JSON file, command arguments, logs, or durable review metadata. The SDK call is made with `store=false`, the existing strict JSON Schema, no `tools` field, and `max_output_tokens=2048`. Missing configuration, SDK/provider errors, timeouts, incomplete responses, malformed JSON, schema/identity mismatches, and validation errors fail closed into the existing human-decision path.
 
 For manual commissioning after merge, prepare a JSON file containing one validated `ReviewRequest` (including its exact immutable SHAs and `diff_digest`) and invoke:
 
