@@ -5,10 +5,13 @@ import subprocess
 import tempfile
 import traceback
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 
 from orchestrator.contract import State
+from orchestrator.live_review import main as live_review_main
 from orchestrator.reviewer import (
     Finding,
     DurableReviewRecord,
@@ -109,6 +112,17 @@ class SliceCTests(unittest.TestCase):
         self.assertEqual(records[0]["findings"][0]["finding_id"], finding.finding_id)
         self.assertEqual(records[0]["provider_metadata"], {"model": "review-model"})
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_live_review_audit_log_help_describes_actual_guarantees(self):
+        output = StringIO()
+        with self.assertRaisesRegex(SystemExit, "0"), redirect_stdout(output):
+            live_review_main(["--help"])
+
+        help_text = output.getvalue().lower()
+        self.assertIn("durable, append-oriented local jsonl log", help_text)
+        self.assertNotIn("append-only", help_text)
+        self.assertNotIn("tamper-evident", help_text)
+        self.assertNotIn("os-enforced", help_text)
 
     def test_review_audit_log_rejects_oversized_provider_metadata(self):
         request = self.request()

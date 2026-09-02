@@ -13,7 +13,7 @@ from .reviewer import OpenAIResponsesReviewer, ReviewAuditLog, ReviewRequest
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Commission one live OpenAI review; no tools or mutations are available.")
     parser.add_argument("--request-json", required=True, type=Path, help="path to a JSON-encoded ReviewRequest")
-    parser.add_argument("--audit-log", type=Path, help="append-only local JSONL log (default: next to the request)")
+    parser.add_argument("--audit-log", type=Path, help="durable, append-oriented local JSONL log (default: next to the request)")
     args = parser.parse_args(argv)
     try:
         request_path = args.request_json.resolve()
