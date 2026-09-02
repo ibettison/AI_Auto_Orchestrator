@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import time
@@ -225,16 +226,75 @@ REVIEW_INSTRUCTIONS = """Trusted instructions: review only the supplied objectiv
 
 
 class OpenAIResponsesReviewer:
-    """Structural Responses API boundary; no default transport and no live call."""
+    """Bounded Responses API reviewer with an injectable transport for tests."""
+
+    API_KEY_ENV = "OPENAI_API_KEY"
+    MODEL_ENV = "OPENAI_REVIEWER_MODEL"
+    TIMEOUT_ENV = "OPENAI_REVIEWER_TIMEOUT_SECONDS"
+
     def __init__(self, model: str, timeout_seconds: float = 30.0, max_output_tokens: int = 2048, transport: Callable[[Mapping[str, Any], float], Mapping[str, Any]] | None = None):
         if not model or timeout_seconds <= 0 or max_output_tokens < 1:
             raise ReviewError("invalid provider bounds")
         self.model, self.timeout_seconds, self.max_output_tokens, self.transport = model, timeout_seconds, max_output_tokens, transport
 
+    @classmethod
+    def from_environment(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        *,
+        client_factory: Callable[[str, float], Any] | None = None,
+        max_output_tokens: int = 2048,
+    ) -> "OpenAIResponsesReviewer":
+        """Build the live reviewer from runtime-only configuration.
+
+        The API key is passed directly to the SDK and is never included in the
+        request body, provider metadata, or error text.
+        """
+        values = os.environ if environ is None else environ
+        api_key = values.get(cls.API_KEY_ENV)
+        model = values.get(cls.MODEL_ENV)
+        timeout_value = values.get(cls.TIMEOUT_ENV)
+        if not api_key or not model or not timeout_value:
+            raise ReviewError(f"{cls.API_KEY_ENV}, {cls.MODEL_ENV}, and {cls.TIMEOUT_ENV} are required")
+        try:
+            timeout = float(timeout_value)
+        except (TypeError, ValueError) as exc:
+            raise ReviewError(f"{cls.TIMEOUT_ENV} must be a positive number") from exc
+        if timeout <= 0:
+            raise ReviewError(f"{cls.TIMEOUT_ENV} must be a positive number")
+
+        if client_factory is None:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:  # pragma: no cover - exercised by installation smoke tests
+                raise ReviewError("the openai package is required for live review") from exc
+            client_factory = lambda key, request_timeout: OpenAI(api_key=key, timeout=request_timeout)
+        client = client_factory(api_key, timeout)
+
+        def transport(body: Mapping[str, Any], request_timeout: float) -> Mapping[str, Any]:
+            try:
+                response = client.responses.create(**dict(body), timeout=request_timeout)
+                status = getattr(response, "status", None)
+                usage = getattr(response, "usage", None)
+                usage_value = {
+                    key: getattr(usage, key)
+                    for key in ("input_tokens", "output_tokens", "total_tokens")
+                    if usage is not None and getattr(usage, key, None) is not None
+                }
+                output_text = getattr(response, "output_text", None)
+                structured_output = json.loads(output_text) if isinstance(output_text, str) else None
+                return {"status": status, "usage": usage_value, "structured_output": structured_output}
+            except Exception as exc:
+                # Do not include SDK exception text: it can contain request data
+                # or provider details and must never expose runtime credentials.
+                raise ProviderFailure("OpenAI Responses request failed") from exc
+
+        return cls(model, timeout, max_output_tokens, transport)
+
     def review(self, request: ReviewRequest) -> ReviewResult:
         request.validate()
         if self.transport is None:
-            raise ProviderFailure("live OpenAI transport is disabled in Slice C")
+            raise ProviderFailure("live OpenAI transport is not configured")
         body = {"model": self.model, "store": False, "input": [{"role": "system", "content": REVIEW_INSTRUCTIONS}, {"role": "user", "content": json.dumps({"review_id": request.review_id, "run_id": request.run_id, "objective": request.objective, "repository": request.repository, "base_sha": request.base_sha, "head_sha": request.head_sha, "diff": request.diff, "validation_evidence": dict(request.validation_evidence), "cycle": request.cycle}, sort_keys=True)}], "text": {"format": {"type": "json_schema", "name": "independent_review", "strict": True, "schema": REVIEW_JSON_SCHEMA}}, "max_output_tokens": self.max_output_tokens}
         started = time.monotonic()
         try:
