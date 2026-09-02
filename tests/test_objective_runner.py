@@ -3,11 +3,14 @@ import re
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 from orchestrator.objective_runner import (
     CodexResult,
     DurableRun,
+    GitHubAppClient,
     ObjectiveProfile,
     ObjectiveRunError,
     ObjectiveRunner,
@@ -193,6 +196,30 @@ def check_failed_validation_fails_without_pr(tmp_path):
     assert github.head is None
 
 
+def check_mutating_validation_fails_without_pr(tmp_path):
+    source = source_repo(tmp_path)
+    checker = source / "src" / "mutating_check.py"
+    checker.write_text("from pathlib import Path\nPath('src/generated.txt').write_text('unexpected')\n", encoding="utf-8")
+    git(source, "add", "src/mutating_check.py")
+    git(source, "commit", "-m", "add mutating check")
+    git(source, "push", "origin", "main")
+    github = FakeGitHub()
+    checks = (("python3", "src/mutating_check.py"),)
+    with raises(ObjectiveRunError, match="mutated the workspace"):
+        ObjectiveRunner(EditingCodex([change_app("implemented\n")]), CallableReviewer(approved), github).execute(
+            "Change the app", profile(source, checks=checks), tmp_path / "state", "run-mutation")
+    assert github.head is None
+
+
+def check_github_http_error_fails_closed(_tmp_path):
+    client = GitHubAppClient()
+    error = urllib.error.HTTPError("https://api.github.com/test", 403, "forbidden", {}, None)
+    with patch.object(client, "_credential", return_value=("app", "secret")):
+        with patch("urllib.request.urlopen", side_effect=error):
+            with raises(ObjectiveRunError, match="failed closed"):
+                client._request(Path("/tmp"), "GET", "https://api.github.com/test")
+
+
 def check_terminal_run_id_cannot_be_reused(tmp_path):
     source = source_repo(tmp_path)
     runner = ObjectiveRunner(EditingCodex([change_app("implemented\n")]), CallableReviewer(approved), FakeGitHub())
@@ -245,6 +272,12 @@ class TestObjectiveRunner(unittest.TestCase):
 
     def test_failed_validation_fails_without_pr(self):
         self.invoke(check_failed_validation_fails_without_pr)
+
+    def test_mutating_validation_fails_without_pr(self):
+        self.invoke(check_mutating_validation_fails_without_pr)
+
+    def test_github_http_error_fails_closed(self):
+        self.invoke(check_github_http_error_fails_closed)
 
     def test_terminal_run_id_cannot_be_reused(self):
         self.invoke(check_terminal_run_id_cannot_be_reused)

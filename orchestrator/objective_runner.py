@@ -286,7 +286,11 @@ class GitHubAppClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                if not 200 <= response.status < 300:
+                    raise ObjectiveRunError("GitHub request failed closed")
                 return json.loads(response.read().decode())
+        except urllib.error.HTTPError:
+            raise ObjectiveRunError("GitHub request failed closed") from None
         except (urllib.error.URLError, json.JSONDecodeError):
             raise ObjectiveRunError("GitHub request failed closed") from None
         finally:
@@ -381,14 +385,28 @@ class ObjectiveRunner:
         run.append("VALIDATION_PASSED", checks=evidence["checks"])
         return evidence
 
+    @classmethod
+    def _immutable_checks(cls, workspace: Path, profile: ObjectiveProfile, run: DurableRun,
+                          expected_inventory: Mapping[str, object]) -> Mapping[str, object]:
+        evidence = cls._checks(workspace, profile, run)
+        if cls._inventory(workspace) != expected_inventory:
+            raise ObjectiveRunError("validation command mutated the workspace")
+        return evidence
+
     @staticmethod
     def _commit(workspace: Path, paths: Sequence[str], message: str) -> str:
         _git(workspace, "config", "user.name", "LayMatched AI Orchestrator")
         _git(workspace, "config", "user.email", "orchestrator@example.invalid")
         _git(workspace, "add", "-A", "--", *paths)
-        if not _git(workspace, "diff", "--cached", "--name-only"):
+        staged = tuple(sorted(_git(workspace, "diff", "--cached", "--name-only").splitlines()))
+        expected = tuple(sorted(paths))
+        if not staged:
             raise ObjectiveRunError("Codex produced no committable change")
+        if staged != expected:
+            raise ObjectiveRunError("staged paths do not match the validated change set")
         _git(workspace, "commit", "-m", message, timeout=120)
+        if _git(workspace, "status", "--porcelain", "--untracked-files=all"):
+            raise ObjectiveRunError("workspace is not clean after commit")
         sha = _git(workspace, "rev-parse", "HEAD")
         if not _SHA.fullmatch(sha):
             raise ObjectiveRunError("commit SHA is invalid")
@@ -427,8 +445,8 @@ class ObjectiveRunner:
                 raise ObjectiveRunError("Codex introduced a symlink")
             changed = self._changed(baseline, current)
             PathPolicy(profile.allowed_paths).verify(changed)
-            evidence = self._checks(workspace, profile, run)
-            head_sha = self._commit(workspace, profile.allowed_paths, f"Implement objective {run_id}")
+            evidence = self._immutable_checks(workspace, profile, run, current)
+            head_sha = self._commit(workspace, changed, f"Implement objective {run_id}")
             self.github.push(workspace, branch)
             pr_number, pr_url = self.github.create_pr(
                 workspace, profile.repository, branch, profile.base_branch,
@@ -491,8 +509,8 @@ class ObjectiveRunner:
                 if "SYMLINK" in after_fix.values():
                     raise ObjectiveRunError("Codex introduced a symlink")
                 PathPolicy(profile.allowed_paths).verify(self._changed(before_fix, after_fix))
-                evidence = self._checks(workspace, profile, run)
-                next_sha = self._commit(workspace, profile.allowed_paths, f"Address review findings for {run_id}")
+                evidence = self._immutable_checks(workspace, profile, run, after_fix)
+                next_sha = self._commit(workspace, self._changed(before_fix, after_fix), f"Address review findings for {run_id}")
                 if next_sha == head_sha:
                     raise ObjectiveRunError("fix did not change the PR head")
                 self.github.push(workspace, branch)
