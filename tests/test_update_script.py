@@ -25,7 +25,7 @@ class UpdateScriptTests(unittest.TestCase):
         (self.venv / "bin").mkdir(parents=True)
         self.python = self.venv / "bin" / "python"
         (self.venv / "runtime-version").write_text("previous\n", encoding="utf-8")
-        self.python.write_text("#!/bin/sh\ncase \"$*\" in\n  *'-m pip install'*) if [ \"${FAIL_INSTALL:-0}\" = 1 ]; then exit 17; fi; runtime_dir=\"$(dirname \"$0\")\"; printf 'candidate\\n' > \"$runtime_dir/../runtime-version\"; for command in orchestrator-live-review orchestrator-prepare-live-review; do printf '#!%s\\nexit 0\\n' \"$0\" > \"$runtime_dir/$command\"; chmod 755 \"$runtime_dir/$command\"; done; exit 0 ;;\n  *'unittest discover'*) if [ \"${FAIL_TEST:-0}\" = 1 ]; then exit 23; fi; exit 0 ;;\n  *) exit 0 ;;\nesac\n", encoding="utf-8")
+        self.python.write_text("#!/bin/sh\ncase \"$*\" in\n  *'-m pip install'*) if [ \"${FAIL_INSTALL:-0}\" = 1 ]; then exit 17; fi; runtime_dir=\"$(dirname \"$0\")\"; printf 'candidate\\n' > \"$runtime_dir/../runtime-version\"; for command in orchestrator-live-review orchestrator-prepare-live-review orchestrator-run-objective; do printf '#!%s\\nexit 0\\n' \"$0\" > \"$runtime_dir/$command\"; chmod 755 \"$runtime_dir/$command\"; done; exit 0 ;;\n  *'unittest discover'*) if [ \"${FAIL_TEST:-0}\" = 1 ]; then exit 23; fi; exit 0 ;;\n  *) exit 0 ;;\nesac\n", encoding="utf-8")
         self.python.chmod(0o755)
 
     def tearDown(self):
@@ -76,7 +76,7 @@ class UpdateScriptTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        for command in ("orchestrator-live-review", "orchestrator-prepare-live-review"):
+        for command in ("orchestrator-live-review", "orchestrator-prepare-live-review", "orchestrator-run-objective"):
             entry_point = self.venv / "bin" / command
             self.assertEqual(entry_point.read_text(encoding="utf-8").splitlines()[0], f"#!{self.python}")
             self.assertEqual(subprocess.run([str(entry_point), "--help"], check=False).returncode, 0)
