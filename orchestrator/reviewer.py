@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -231,9 +232,10 @@ class OpenAIResponsesReviewer:
     API_KEY_ENV = "OPENAI_API_KEY"
     MODEL_ENV = "OPENAI_REVIEWER_MODEL"
     TIMEOUT_ENV = "OPENAI_REVIEWER_TIMEOUT_SECONDS"
+    MAX_TIMEOUT_SECONDS = 120.0
 
     def __init__(self, model: str, timeout_seconds: float = 30.0, max_output_tokens: int = 2048, transport: Callable[[Mapping[str, Any], float], Mapping[str, Any]] | None = None):
-        if not model or timeout_seconds <= 0 or max_output_tokens < 1:
+        if not model or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= self.MAX_TIMEOUT_SECONDS or max_output_tokens < 1:
             raise ReviewError("invalid provider bounds")
         self.model, self.timeout_seconds, self.max_output_tokens, self.transport = model, timeout_seconds, max_output_tokens, transport
 
@@ -260,8 +262,8 @@ class OpenAIResponsesReviewer:
             timeout = float(timeout_value)
         except (TypeError, ValueError) as exc:
             raise ReviewError(f"{cls.TIMEOUT_ENV} must be a positive number") from exc
-        if timeout <= 0:
-            raise ReviewError(f"{cls.TIMEOUT_ENV} must be a positive number")
+        if not math.isfinite(timeout) or not 0 < timeout <= cls.MAX_TIMEOUT_SECONDS:
+            raise ReviewError(f"{cls.TIMEOUT_ENV} must be greater than 0 and no more than {cls.MAX_TIMEOUT_SECONDS:g} seconds")
 
         if client_factory is None:
             try:
@@ -284,10 +286,11 @@ class OpenAIResponsesReviewer:
                 output_text = getattr(response, "output_text", None)
                 structured_output = json.loads(output_text) if isinstance(output_text, str) else None
                 return {"status": status, "usage": usage_value, "structured_output": structured_output}
-            except Exception as exc:
+            except Exception:
                 # Do not include SDK exception text: it can contain request data
                 # or provider details and must never expose runtime credentials.
-                raise ProviderFailure("OpenAI Responses request failed") from exc
+                pass
+            raise ProviderFailure("OpenAI Responses request failed")
 
         return cls(model, timeout, max_output_tokens, transport)
 
