@@ -133,6 +133,9 @@ def check_approved_exact_sha_stops_for_human_merge(tmp_path):
     assert github.comments and outcome.head_sha in github.comments[0]
     assert "Closes #" not in github.pr_body
     assert json.loads((tmp_path / "state/run-1/result.json").read_text())["state"] == outcome.state
+    events = [json.loads(line) for line in (tmp_path / "state/run-1/events.jsonl").read_text().splitlines()]
+    changeset = next(item for item in events if item["event"] == "CHANGESET_VALIDATED")
+    assert changeset["details"]["paths"] == ["src/app.txt"]
     assert not (tmp_path / "state/run-1/workspace").exists()
 
 
@@ -252,6 +255,15 @@ def check_git_subprocess_excludes_ambient_secrets(tmp_path):
     child_environment = run.call_args.kwargs["env"]
     assert "OPENAI_API_KEY" not in child_environment
     assert set(child_environment).issubset({"HOME", "PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_HOME"})
+    assert "core.hooksPath=/dev/null" in run.call_args.args[0]
+    assert "commit.gpgSign=false" in run.call_args.args[0]
+
+
+def check_git_failure_names_only_trusted_operation(tmp_path):
+    failed = subprocess.CompletedProcess(["git"], 1, stdout="sensitive output", stderr="secret-token")
+    with patch("subprocess.run", return_value=failed):
+        with raises(ObjectiveRunError, match="^git commit failed closed$"):
+            _git(tmp_path, "commit", "-m", "untrusted objective text")
 
 
 def check_terminal_run_id_cannot_be_reused(tmp_path):
@@ -318,6 +330,9 @@ class TestObjectiveRunner(unittest.TestCase):
 
     def test_git_subprocess_excludes_ambient_secrets(self):
         self.invoke(check_git_subprocess_excludes_ambient_secrets)
+
+    def test_git_failure_names_only_trusted_operation(self):
+        self.invoke(check_git_failure_names_only_trusted_operation)
 
     def test_terminal_run_id_cannot_be_reused(self):
         self.invoke(check_terminal_run_id_cannot_be_reused)
