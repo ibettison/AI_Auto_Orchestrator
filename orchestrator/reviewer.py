@@ -51,11 +51,47 @@ class Severity(StrEnum):
 
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _MAX_TEXT = 4096
+_MAX_PROVIDER_METADATA_ENTRIES = 16
+_MAX_PROVIDER_METADATA_KEY = 64
+_MAX_PROVIDER_METADATA_TEXT = 512
+_MAX_PROVIDER_METADATA_BYTES = 4096
+_MAX_PROVIDER_METADATA_DEPTH = 2
 
 
 def _bounded(value: Any, limit: int = _MAX_TEXT) -> str:
-    return str(value).replace("\x00", " ").replace("\r", " ").replace("\n", " ")[:limit]
+    return str(value).replace("\\x00", " ").replace("\\r", " ").replace("\\n", " ")[:limit]
 
+
+def _bounded_provider_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and copy provider metadata within explicit persistence bounds."""
+
+    def normalize(item: Any, depth: int) -> Any:
+        if isinstance(item, Mapping):
+            if depth > _MAX_PROVIDER_METADATA_DEPTH or len(item) > _MAX_PROVIDER_METADATA_ENTRIES:
+                raise ReviewError("provider metadata exceeds structural bounds")
+            normalized = {}
+            for key, child in item.items():
+                if not isinstance(key, str) or not key or len(key) > _MAX_PROVIDER_METADATA_KEY:
+                    raise ReviewError("provider metadata key exceeds bounds")
+                normalized[key] = normalize(child, depth + 1)
+            return normalized
+        if item is None or isinstance(item, (bool, int)):
+            return item
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ReviewError("provider metadata contains a non-finite number")
+            return item
+        if isinstance(item, str):
+            if len(item) > _MAX_PROVIDER_METADATA_TEXT:
+                raise ReviewError("provider metadata text exceeds bounds")
+            return item
+        raise ReviewError("provider metadata contains an unsupported value")
+
+    normalized = normalize(value, 0)
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+    if len(encoded) > _MAX_PROVIDER_METADATA_BYTES:
+        raise ReviewError("provider metadata exceeds serialized size bound")
+    return normalized
 
 @dataclass(frozen=True)
 class Finding:
@@ -151,7 +187,7 @@ class ReviewResult:
 
 
 class ReviewAuditLog:
-    """Append validated review results to a credential-free local JSONL log."""
+    """Persist validated review results as durable, append-oriented local JSONL."""
 
     SCHEMA_VERSION = 1
 
@@ -189,7 +225,7 @@ class ReviewAuditLog:
                 }
                 for finding in result.findings
             ],
-            "provider_metadata": dict(result.provider_metadata),
+            "provider_metadata": _bounded_provider_metadata(result.provider_metadata),
         }
         try:
             encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
