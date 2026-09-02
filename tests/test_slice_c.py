@@ -110,6 +110,21 @@ class SliceCTests(unittest.TestCase):
         self.assertEqual(records[0]["provider_metadata"], {"model": "review-model"})
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
+    def test_review_audit_log_rejects_oversized_provider_metadata(self):
+        request = self.request()
+        path = Path(self.temp.name) / "oversized-reviews.jsonl"
+        oversized_values = (
+            {"text": "x" * 513},
+            {f"key-{index}": index for index in range(17)},
+            {"nested": {"deeper": {"too_deep": {"value": 1}}}},
+        )
+        for metadata in oversized_values:
+            with self.subTest(metadata=list(metadata)):
+                result = replace(self.approved(request), provider_metadata=metadata)
+                with self.assertRaises(ReviewError):
+                    ReviewAuditLog(path.resolve()).append(request, result)
+                self.assertFalse(path.exists())
+
     def test_review_audit_log_rejects_relative_path_and_symlink(self):
         with self.assertRaises(ReviewError):
             ReviewAuditLog(Path("reviews.jsonl"))
