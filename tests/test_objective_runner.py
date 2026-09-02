@@ -67,7 +67,8 @@ class FakeGitHub:
         self.comments = []
         self.pr_body = None
 
-    def push(self, workspace, branch):
+    def push(self, workspace, repository, branch):
+        self.pushed_repository = repository
         self.head = git(workspace, "rev-parse", "HEAD")
 
     def create_pr(self, workspace, repository, branch, base, title, body):
@@ -267,6 +268,34 @@ def check_tracked_deletion_survives_ignored_artifact_filter(tmp_path):
     assert changeset["details"]["paths"] == ["src/app.txt"]
 
 
+def check_github_push_uses_trusted_repository_url(_tmp_path):
+    calls = []
+
+    def capture(workspace, *args, **kwargs):
+        calls.append((workspace, args, kwargs))
+        return ""
+
+    with patch("orchestrator.objective_runner._git", side_effect=capture):
+        GitHubAppClient().push(Path("/tmp/workspace"), "owner/repo", "codex/run-1")
+
+    assert calls == [
+        (
+            Path("/tmp/workspace"),
+            ("push", "https://github.com/owner/repo.git", "HEAD:refs/heads/codex/run-1"),
+            {"timeout": 120},
+        )
+    ]
+
+    with patch("orchestrator.objective_runner._git") as mocked:
+        try:
+            GitHubAppClient().push(Path("/tmp/workspace"), "owner/repo?token=unsafe", "codex/run-1")
+        except ObjectiveRunError:
+            pass
+        else:
+            raise AssertionError("unsafe repository identity was accepted")
+        mocked.assert_not_called()
+
+
 def check_github_http_error_fails_closed(_tmp_path):
     client = GitHubAppClient()
     error = urllib.error.HTTPError("https://api.github.com/test", 403, "forbidden", {}, None)
@@ -374,6 +403,9 @@ class TestObjectiveRunner(unittest.TestCase):
 
     def test_tracked_deletion_survives_ignored_artifact_filter(self):
         self.invoke(check_tracked_deletion_survives_ignored_artifact_filter)
+
+    def test_github_push_uses_trusted_repository_url(self):
+        self.invoke(check_github_push_uses_trusted_repository_url)
 
     def test_github_http_error_fails_closed(self):
         self.invoke(check_github_http_error_fails_closed)

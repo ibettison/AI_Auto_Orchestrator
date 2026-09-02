@@ -291,7 +291,7 @@ class PullRequestIdentity:
 
 
 class GitHubPort(Protocol):
-    def push(self, workspace: Path, branch: str) -> None: ...
+    def push(self, workspace: Path, repository: str, branch: str) -> None: ...
     def create_pr(self, workspace: Path, repository: str, branch: str, base: str, title: str, body: str) -> PullRequestIdentity: ...
     def head_sha(self, workspace: Path, repository: str, pr_number: int) -> str: ...
     def comment(self, workspace: Path, repository: str, pr_number: int, body: str) -> None: ...
@@ -335,8 +335,11 @@ class GitHubAppClient:
         finally:
             token = ""  # Do not retain or report the installation token.
 
-    def push(self, workspace: Path, branch: str) -> None:
-        _git(workspace, "push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}", timeout=120)
+    def push(self, workspace: Path, repository: str, branch: str) -> None:
+        if not _REPOSITORY.fullmatch(repository):
+            raise ObjectiveRunError("GitHub repository identity is invalid")
+        trusted_remote = f"https://github.com/{repository}.git"
+        _git(workspace, "push", trusted_remote, f"HEAD:refs/heads/{branch}", timeout=120)
 
     def create_pr(self, workspace: Path, repository: str, branch: str, base: str, title: str, body: str) -> PullRequestIdentity:
         owner = repository.split("/", 1)[0]
@@ -500,7 +503,7 @@ class ObjectiveRunner:
             run.append("CHANGESET_VALIDATED", phase="implementation", paths=changed)
             evidence = self._immutable_checks(workspace, profile, run, current)
             head_sha = self._commit(workspace, changed, f"Implement objective {run_id}")
-            self.github.push(workspace, branch)
+            self.github.push(workspace, profile.repository, branch)
             pr = self.github.create_pr(
                 workspace, profile.repository, branch, profile.base_branch,
                 f"Objective: {_bounded(objective, 120)}",
@@ -571,7 +574,7 @@ class ObjectiveRunner:
                 next_sha = self._commit(workspace, self._changed(before_fix, after_fix), f"Address review findings for {run_id}")
                 if next_sha == head_sha:
                     raise ObjectiveRunError("fix did not change the PR head")
-                self.github.push(workspace, branch)
+                self.github.push(workspace, profile.repository, branch)
                 run.append("FIX_PUSHED", cycle=cycle, prior_head_sha=head_sha, head_sha=next_sha)
                 head_sha = next_sha
             return self._terminal(run, "human_decision_required", "review cycle exhausted", run_id, branch, pr_number, pr_url, head_sha, profile.max_cycles)
