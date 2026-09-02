@@ -451,7 +451,7 @@ class ObjectiveRunner:
             pr_number, pr_url = self.github.create_pr(
                 workspace, profile.repository, branch, profile.base_branch,
                 f"Objective: {_bounded(objective, 120)}",
-                f"Closes #9\n\nAutonomous bounded run: `{run_id}`.\n\nNo automatic merge or deployment.",
+                f"Autonomous bounded run: `{run_id}`.\n\nNo automatic merge or deployment.",
             )
             run.append("PR_CREATED", pr_number=pr_number, pr_url=pr_url, head_sha=head_sha)
 

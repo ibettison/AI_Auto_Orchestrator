@@ -62,11 +62,13 @@ class FakeGitHub:
         self.head = None
         self.override_head = None
         self.comments = []
+        self.pr_body = None
 
     def push(self, workspace, branch):
         self.head = git(workspace, "rev-parse", "HEAD")
 
     def create_pr(self, workspace, repository, branch, base, title, body):
+        self.pr_body = body
         return 41, "https://example.invalid/pull/41"
 
     def head_sha(self, workspace, repository, pr_number):
@@ -126,6 +128,7 @@ def check_approved_exact_sha_stops_for_human_merge(tmp_path):
     assert outcome.state == "human_merge_approval_required"
     assert reviewer.requests[0].head_sha == outcome.head_sha == github.head
     assert github.comments and outcome.head_sha in github.comments[0]
+    assert "Closes #" not in github.pr_body
     assert json.loads((tmp_path / "state/run-1/result.json").read_text())["state"] == outcome.state
     assert not (tmp_path / "state/run-1/workspace").exists()
 
