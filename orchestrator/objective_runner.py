@@ -251,9 +251,17 @@ class CodexSdkExecutor:
         return CodexResult(str(payload.get("response", "")))
 
 
+@dataclass(frozen=True)
+class PullRequestIdentity:
+    number: int
+    url: str
+    head_repository: str
+    head_branch: str
+
+
 class GitHubPort(Protocol):
     def push(self, workspace: Path, branch: str) -> None: ...
-    def create_pr(self, workspace: Path, repository: str, branch: str, base: str, title: str, body: str) -> tuple[int, str]: ...
+    def create_pr(self, workspace: Path, repository: str, branch: str, base: str, title: str, body: str) -> PullRequestIdentity: ...
     def head_sha(self, workspace: Path, repository: str, pr_number: int) -> str: ...
     def comment(self, workspace: Path, repository: str, pr_number: int, body: str) -> None: ...
 
@@ -299,12 +307,17 @@ class GitHubAppClient:
     def push(self, workspace: Path, branch: str) -> None:
         _git(workspace, "push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}", timeout=120)
 
-    def create_pr(self, workspace: Path, repository: str, branch: str, base: str, title: str, body: str) -> tuple[int, str]:
+    def create_pr(self, workspace: Path, repository: str, branch: str, base: str, title: str, body: str) -> PullRequestIdentity:
+        owner = repository.split("/", 1)[0]
         value = self._request(workspace, "POST", f"https://api.github.com/repos/{repository}/pulls",
-                              {"head": branch, "base": base, "title": title, "body": body})
-        if not isinstance(value.get("number"), int) or not isinstance(value.get("html_url"), str):
+                              {"head": f"{owner}:{branch}", "base": base, "title": title, "body": body})
+        head = value.get("head", {})
+        head_repository = head.get("repo", {}).get("full_name")
+        head_branch = head.get("ref")
+        if (not isinstance(value.get("number"), int) or not isinstance(value.get("html_url"), str)
+                or head_repository != repository or head_branch != branch):
             raise ObjectiveRunError("GitHub returned an invalid PR identity")
-        return value["number"], value["html_url"]
+        return PullRequestIdentity(value["number"], value["html_url"], head_repository, head_branch)
 
     def head_sha(self, workspace: Path, repository: str, pr_number: int) -> str:
         value = self._request(workspace, "GET", f"https://api.github.com/repos/{repository}/pulls/{pr_number}")
@@ -448,11 +461,14 @@ class ObjectiveRunner:
             evidence = self._immutable_checks(workspace, profile, run, current)
             head_sha = self._commit(workspace, changed, f"Implement objective {run_id}")
             self.github.push(workspace, branch)
-            pr_number, pr_url = self.github.create_pr(
+            pr = self.github.create_pr(
                 workspace, profile.repository, branch, profile.base_branch,
                 f"Objective: {_bounded(objective, 120)}",
                 f"Autonomous bounded run: `{run_id}`.\n\nNo automatic merge or deployment.",
             )
+            if pr.head_repository != profile.repository or pr.head_branch != branch:
+                raise ObjectiveRunError("created PR does not match the pushed repository branch")
+            pr_number, pr_url = pr.number, pr.url
             run.append("PR_CREATED", pr_number=pr_number, pr_url=pr_url, head_sha=head_sha)
 
             finding_fingerprints: set[str] = set()

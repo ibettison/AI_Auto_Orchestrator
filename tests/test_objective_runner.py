@@ -14,6 +14,7 @@ from orchestrator.objective_runner import (
     ObjectiveProfile,
     ObjectiveRunError,
     ObjectiveRunner,
+    PullRequestIdentity,
 )
 from orchestrator.reviewer import Finding, ReviewResult, Severity, Verdict
 
@@ -69,7 +70,7 @@ class FakeGitHub:
 
     def create_pr(self, workspace, repository, branch, base, title, body):
         self.pr_body = body
-        return 41, "https://example.invalid/pull/41"
+        return PullRequestIdentity(41, "https://example.invalid/pull/41", repository, branch)
 
     def head_sha(self, workspace, repository, pr_number):
         return self.override_head or self.head
@@ -223,6 +224,24 @@ def check_github_http_error_fails_closed(_tmp_path):
                 client._request(Path("/tmp"), "GET", "https://api.github.com/test")
 
 
+def check_pr_head_is_owner_qualified_and_verified(_tmp_path):
+    client = GitHubAppClient()
+    response = {
+        "number": 41,
+        "html_url": "https://example.invalid/pull/41",
+        "head": {"ref": "codex/run-1", "repo": {"full_name": "owner/repo"}},
+    }
+    with patch.object(client, "_request", return_value=response) as request:
+        identity = client.create_pr(Path("/tmp"), "owner/repo", "codex/run-1", "main", "title", "body")
+    assert identity.head_repository == "owner/repo"
+    assert request.call_args.args[3]["head"] == "owner:codex/run-1"
+
+    response["head"] = {"ref": "codex/run-1", "repo": {"full_name": "other/repo"}}
+    with patch.object(client, "_request", return_value=response):
+        with raises(ObjectiveRunError, match="invalid PR identity"):
+            client.create_pr(Path("/tmp"), "owner/repo", "codex/run-1", "main", "title", "body")
+
+
 def check_terminal_run_id_cannot_be_reused(tmp_path):
     source = source_repo(tmp_path)
     runner = ObjectiveRunner(EditingCodex([change_app("implemented\n")]), CallableReviewer(approved), FakeGitHub())
@@ -281,6 +300,9 @@ class TestObjectiveRunner(unittest.TestCase):
 
     def test_github_http_error_fails_closed(self):
         self.invoke(check_github_http_error_fails_closed)
+
+    def test_pr_head_is_owner_qualified_and_verified(self):
+        self.invoke(check_pr_head_is_owner_qualified_and_verified)
 
     def test_terminal_run_id_cannot_be_reused(self):
         self.invoke(check_terminal_run_id_cannot_be_reused)
