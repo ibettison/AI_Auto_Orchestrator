@@ -53,7 +53,21 @@ export OPENAI_REVIEWER_TIMEOUT_SECONDS='30'
 
 Set these in the AWS orchestration host's runtime secret/configuration mechanism. `OPENAI_REVIEWER_TIMEOUT_SECONDS` must be greater than 0 and no more than 120 seconds; the upper bound prevents a configuration typo from creating an effectively unbounded orchestration wait. Do not put the API key in Git, a request JSON file, command arguments, logs, or durable review metadata. The SDK call is made with `store=false`, the existing strict JSON Schema, no `tools` field, and `max_output_tokens=2048`. Missing configuration, SDK/provider errors, timeouts, incomplete responses, malformed JSON, schema/identity mismatches, and validation errors fail closed into the existing human-decision path.
 
-For manual commissioning after merge, prepare a JSON file containing one validated `ReviewRequest` (including its exact immutable SHAs and `diff_digest`) and invoke:
+For manual commissioning after merge, use this exact sequence: prepare the request, manually inspect its metadata, then invoke `live_review`. The preparation command requires exact immutable base/head SHAs, checks that the local worktree is clean, and delegates SHA/diff/digest binding to `ReviewInputPreparer`; it makes no OpenAI call and writes only the explicitly supplied output file:
+
+```bash
+python3 -m orchestrator.prepare_live_review \
+  --repository /secure/path/repository \
+  --base-sha '<exact-base-commit-sha>' \
+  --head-sha '<exact-head-commit-sha>' \
+  --review-id 'commission-2026-09-02-001' \
+  --run-id 'commission-2026-09-02' \
+  --objective 'Review the bounded change described by this run.' \
+  --validation-evidence-json '{"passed":true}' \
+  --output /secure/path/review-request.json
+```
+
+Manually inspect `/secure/path/review-request.json`, especially `repository`, `base_sha`, `head_sha`, `diff_digest`, `cycle`, `risk`, and the validation evidence. Do not edit the request after inspection. Then invoke:
 
 ```bash
 OPENAI_API_KEY="$OPENAI_API_KEY" \

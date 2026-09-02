@@ -12,6 +12,7 @@ dependencies = ["openai>=1.68.0"]
 [project.scripts]
 orchestrator-sim = "orchestrator.simulator:main"
 orchestrator-live-review = "orchestrator.live_review:main"
+orchestrator-prepare-live-review = "orchestrator.prepare_live_review:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
