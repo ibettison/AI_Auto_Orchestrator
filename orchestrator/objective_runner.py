@@ -403,7 +403,9 @@ class ObjectiveRunner:
         values: dict[str, tuple[str, bool] | str] = {}
         # Git's index and ignore policy define commit candidates. Ignored runtime
         # artifacts must never become objective changes or explicit add targets.
-        candidates = _git(workspace, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+        candidates = _git(
+            workspace, "ls-files", "--cached", "--deleted", "--others", "--exclude-standard", "-z",
+        )
         for relative in candidates.split("\x00"):
             if not relative:
                 continue

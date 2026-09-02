@@ -242,6 +242,27 @@ def check_ignored_runtime_artifacts_are_not_changes(tmp_path):
     assert changeset["details"]["paths"] == ["src/app.txt"]
 
 
+def check_tracked_deletion_survives_ignored_artifact_filter(tmp_path):
+    source = source_repo(tmp_path)
+    (source / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
+    git(source, "add", ".gitignore")
+    git(source, "commit", "-m", "ignore Python runtime artifacts")
+    git(source, "push", "origin", "main")
+
+    def delete_with_cache(workspace):
+        (workspace / "src" / "app.txt").unlink()
+        cache = workspace / "src" / "__pycache__"
+        cache.mkdir()
+        (cache / "app.cpython-312.pyc").write_bytes(b"runtime-only")
+
+    outcome = ObjectiveRunner(EditingCodex([delete_with_cache]), CallableReviewer(approved), FakeGitHub()).execute(
+        "Remove the app file", profile(source), tmp_path / "state", "run-deletion")
+    assert outcome.state == "human_merge_approval_required"
+    events = [json.loads(line) for line in (tmp_path / "state/run-deletion/events.jsonl").read_text().splitlines()]
+    changeset = next(item for item in events if item["event"] == "CHANGESET_VALIDATED")
+    assert changeset["details"]["paths"] == ["src/app.txt"]
+
+
 def check_github_http_error_fails_closed(_tmp_path):
     client = GitHubAppClient()
     error = urllib.error.HTTPError("https://api.github.com/test", 403, "forbidden", {}, None)
@@ -346,6 +367,9 @@ class TestObjectiveRunner(unittest.TestCase):
 
     def test_ignored_runtime_artifacts_are_not_changes(self):
         self.invoke(check_ignored_runtime_artifacts_are_not_changes)
+
+    def test_tracked_deletion_survives_ignored_artifact_filter(self):
+        self.invoke(check_tracked_deletion_survives_ignored_artifact_filter)
 
     def test_github_http_error_fails_closed(self):
         self.invoke(check_github_http_error_fails_closed)
