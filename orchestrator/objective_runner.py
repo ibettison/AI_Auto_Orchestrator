@@ -40,6 +40,11 @@ _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SAFE_ENV = ("HOME", "PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_HOME")
+_GIT_PREFIX = ("git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false")
+_GIT_OPERATIONS = frozenset({
+    "add", "checkout", "clone", "commit", "config", "credential", "diff", "fetch", "push",
+    "rev-parse", "status", "switch",
+})
 
 
 def _now() -> str:
@@ -70,7 +75,29 @@ def _run(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None
 
 
 def _git(cwd: Path, *args: str, timeout: float = 30) -> str:
-    return _run(("git", *args), cwd=cwd, env=_safe_environment(), timeout=timeout).stdout.strip()
+    operation = args[0] if args and args[0] in _GIT_OPERATIONS else "operation"
+    try:
+        return _run((*_GIT_PREFIX, *args), cwd=cwd, env=_safe_environment(), timeout=timeout).stdout.strip()
+    except ObjectiveRunError:
+        raise ObjectiveRunError(f"git {operation} failed closed") from None
+
+
+def _ignored_paths(workspace: Path, paths: Sequence[str]) -> tuple[str, ...]:
+    ignored: list[str] = []
+    for path in paths:
+        try:
+            result = subprocess.run(
+                [*_GIT_PREFIX, "check-ignore", "-q", "--", path], cwd=workspace,
+                env=_safe_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=30, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise ObjectiveRunError("git check-ignore failed closed") from None
+        if result.returncode == 0:
+            ignored.append(path)
+        elif result.returncode != 1:
+            raise ObjectiveRunError("git check-ignore failed closed")
+    return tuple(ignored)
 
 
 @dataclass(frozen=True)
@@ -279,7 +306,7 @@ class GitHubAppClient:
     @staticmethod
     def _credential(workspace: Path) -> tuple[str, str]:
         result = _run(
-            ("git", "credential", "fill"), cwd=workspace,
+            (*_GIT_PREFIX, "credential", "fill"), cwd=workspace,
             env=_safe_environment(), input_text="protocol=https\nhost=github.com\n\n", timeout=30,
         )
         values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
@@ -362,8 +389,7 @@ class ObjectiveRunner:
         workspace = run.run_dir / "workspace"
         if workspace.exists():
             raise ObjectiveRunError("workspace already exists")
-        _run(("git", "clone", "--no-local", str(source), str(workspace)), cwd=run.run_dir,
-             env=_safe_environment(), timeout=120)
+        _git(run.run_dir, "clone", "--no-local", str(source), str(workspace), timeout=120)
         branch = f"codex/{run_id}"
         _git(workspace, "checkout", "--detach", base_sha)
         _git(workspace, "switch", "-c", branch)
@@ -413,6 +439,9 @@ class ObjectiveRunner:
 
     @staticmethod
     def _commit(workspace: Path, paths: Sequence[str], message: str) -> str:
+        ignored = _ignored_paths(workspace, paths)
+        if ignored:
+            raise ObjectiveRunError("validated changes include ignored paths")
         _git(workspace, "config", "user.name", "LayMatched AI Orchestrator")
         _git(workspace, "config", "user.email", "orchestrator@example.invalid")
         _git(workspace, "add", "-A", "--", *paths)
@@ -463,6 +492,7 @@ class ObjectiveRunner:
                 raise ObjectiveRunError("Codex introduced a symlink")
             changed = self._changed(baseline, current)
             PathPolicy(profile.allowed_paths).verify(changed)
+            run.append("CHANGESET_VALIDATED", phase="implementation", paths=changed)
             evidence = self._immutable_checks(workspace, profile, run, current)
             head_sha = self._commit(workspace, changed, f"Implement objective {run_id}")
             self.github.push(workspace, branch)
@@ -530,6 +560,7 @@ class ObjectiveRunner:
                 if "SYMLINK" in after_fix.values():
                     raise ObjectiveRunError("Codex introduced a symlink")
                 PathPolicy(profile.allowed_paths).verify(self._changed(before_fix, after_fix))
+                run.append("CHANGESET_VALIDATED", phase="fix", paths=self._changed(before_fix, after_fix))
                 evidence = self._immutable_checks(workspace, profile, run, after_fix)
                 next_sha = self._commit(workspace, self._changed(before_fix, after_fix), f"Address review findings for {run_id}")
                 if next_sha == head_sha:
