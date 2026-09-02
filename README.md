@@ -1,6 +1,6 @@
-# AI Auto Orchestrator — Slice C
+# AI Auto Orchestrator — Slice D
 
-Slice C adds an independent, SHA-bound reviewer and bounded review/fix loop around the Slice A contract and Slice B runner. The offline MVP architecture is:
+Slice D adds the opt-in live OpenAI Responses API transport to the independent, SHA-bound reviewer and bounded review/fix loop from Slice C. The architecture is:
 
 `Objective → bounded Codex runner → validation → immutable diff → independent reviewer → bounded fix/re-review loop → AI approved OR human decision required`
 
@@ -11,7 +11,7 @@ python3 -m unittest discover -v
 python3 -m orchestrator.simulator --scenario all
 ```
 
-The suite uses temporary local Git repositories and `FakeCodexAdapter`; it makes no network calls and requires no Codex account, API, provider, credential, or production system.
+The suite uses temporary local Git repositories, `FakeCodexAdapter`, and fake reviewer transports; it makes no network calls and requires no provider credential.
 
 ## Runner architecture
 
@@ -35,14 +35,37 @@ The command and path policies are intentionally fail closed. They are policy che
 
 `--scenario all` includes Slice A GREEN/AMBER/RED paths plus Slice B runner GREEN, command failure, timeout/process termination, and out-of-scope modification scenarios. Each runner scenario uses a throwaway local repository and cleans it up.
 
-## Slice C reviewer boundary
+## Reviewer boundary
 
 `ReviewInputPreparer` resolves exact Git base and head commits and binds the actual untruncated `base...head` diff to a SHA-256 digest. `ReviewRequest` carries the objective, repository, both SHAs, diff, validation evidence, risk context, and cycle. `ReviewResult` uses bounded verdict/severity enums and is validated before it can affect the state machine. An approval for one head is never valid for another; a changed head during review is escalated.
 
-`ReviewFixLoop` uses the deterministic Slice A reducer, records durable-review-shaped events through `FakeGitHubCoordinator`, limits cycles, fingerprints equivalent findings, and escalates repeated findings, malformed results, provider failures, ambiguous decisions, and RED risk. Slice B validation results now carry the run ID, exact validated head SHA, and review diff digest; both the initial implementation and every fix must match those immutable bindings before state transitions. Repository/diff text is explicitly untrusted data. The `OpenAIResponsesReviewer` is only a structural Responses API boundary using JSON Schema, `store=false`, configured model/limits, and no tools; it has no default transport and no live call is made in this repository.
+`ReviewFixLoop` uses the deterministic Slice A reducer, records durable-review-shaped events through `FakeGitHubCoordinator`, limits cycles, fingerprints equivalent findings, and escalates repeated findings, malformed results, provider failures, ambiguous decisions, and RED risk. Slice B validation results now carry the run ID, exact validated head SHA, and review diff digest; both the initial implementation and every fix must match those immutable bindings before state transitions. Repository/diff text is explicitly untrusted data. The `OpenAIResponsesReviewer` uses Structured Outputs with `REVIEW_JSON_SCHEMA`, `store=false`, an explicitly configured model, bounded output tokens, a request timeout, and no tools. The reviewer has no execution capability.
+
+## Slice D live review
+
+The live transport uses the official `openai` Python SDK and the Responses API `client.responses.create(...)`. It is opt-in and requires all of these runtime settings:
+
+```bash
+export OPENAI_API_KEY='provided by the host secret manager'
+export OPENAI_REVIEWER_MODEL='your-approved-model-id'
+export OPENAI_REVIEWER_TIMEOUT_SECONDS='30'
+```
+
+Set these in the AWS orchestration host's runtime secret/configuration mechanism. `OPENAI_REVIEWER_TIMEOUT_SECONDS` must be greater than 0 and no more than 120 seconds; the upper bound prevents a configuration typo from creating an effectively unbounded orchestration wait. Do not put the API key in Git, a request JSON file, command arguments, logs, or durable review metadata. The SDK call is made with `store=false`, the existing strict JSON Schema, no `tools` field, and `max_output_tokens=2048`. Missing configuration, SDK/provider errors, timeouts, incomplete responses, malformed JSON, schema/identity mismatches, and validation errors fail closed into the existing human-decision path.
+
+For manual commissioning after merge, prepare a JSON file containing one validated `ReviewRequest` (including its exact immutable SHAs and `diff_digest`) and invoke:
+
+```bash
+OPENAI_API_KEY="$OPENAI_API_KEY" \
+OPENAI_REVIEWER_MODEL='your-approved-model-id' \
+OPENAI_REVIEWER_TIMEOUT_SECONDS='30' \
+python3 -m orchestrator.live_review --request-json /secure/path/review-request.json
+```
+
+The command performs one review only. It does not run commands, expose tools to the reviewer, mutate GitHub, merge, deploy, or automatically apply fixes. On any failure it prints only `live review failed closed`; it never prints the API key.
 
 Slice C does not authorise production execution. It does not connect to LayMatched, OpenAI, GitHub mutation APIs, credentials, Stripe, email, DNS, databases, webhooks, CI, or external providers. Production deployment would still require a durable external orchestrator/bridge, separated GitHub App/token identities, secret management, hard network/container isolation, real provider credentials, persistence/durable leases, monitoring, and an explicit production approval path. This repository alone cannot wake or control an existing ChatGPT conversation.
 
 ## Deliberate limitations
 
-Slice C is the final offline MVP slice, not a production executor. It does not implement autonomous merging, sophisticated container resource isolation, durable leases, persisted audit logs, live OpenAI calls, live GitHub mutation, or a real Codex CLI adapter. Oversized review input is rejected rather than silently chunked. Those capabilities require explicit deployment controls and a separate activation decision.
+This repository is not a production executor. It does not implement autonomous merging, sophisticated container resource isolation, durable leases, persisted audit logs, live GitHub mutation, or a real Codex CLI adapter. Oversized review input is rejected rather than silently chunked. Those capabilities require explicit deployment controls and a separate activation decision.
