@@ -2,6 +2,7 @@ import json
 import hashlib
 import subprocess
 import tempfile
+import traceback
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -270,6 +271,36 @@ class SliceCTests(unittest.TestCase):
     def test_live_configuration_requires_all_runtime_settings(self):
         with self.assertRaises(ReviewError):
             OpenAIResponsesReviewer.from_environment({}, client_factory=lambda *_: None)
+
+    def test_live_configuration_timeout_is_finite_and_bounded(self):
+        base = {"OPENAI_API_KEY": "runtime-secret", "OPENAI_REVIEWER_MODEL": "gpt-test"}
+        for timeout in ("not-a-number", "0", "-1", "120.1", "30000", "inf", "nan"):
+            with self.subTest(timeout=timeout), self.assertRaises(ReviewError):
+                OpenAIResponsesReviewer.from_environment({**base, "OPENAI_REVIEWER_TIMEOUT_SECONDS": timeout}, client_factory=lambda *_: None)
+        reviewer = OpenAIResponsesReviewer.from_environment({**base, "OPENAI_REVIEWER_TIMEOUT_SECONDS": "30"}, client_factory=lambda *_: type("Client", (), {})())
+        self.assertEqual(reviewer.timeout_seconds, 30.0)
+
+    def test_live_sdk_failure_has_no_provider_exception_chain_or_traceback_data(self):
+        secret = "secret-like-request-body-value"
+
+        class Responses:
+            def create(self, **_body):
+                raise RuntimeError(f"provider rejected request containing {secret}")
+
+        class Client:
+            responses = Responses()
+
+        reviewer = OpenAIResponsesReviewer.from_environment(
+            {"OPENAI_API_KEY": "runtime-secret", "OPENAI_REVIEWER_MODEL": "gpt-test", "OPENAI_REVIEWER_TIMEOUT_SECONDS": "30"},
+            client_factory=lambda *_: Client(),
+        )
+        with self.assertRaises(ProviderFailure) as raised:
+            reviewer.review(self.request())
+        error = raised.exception
+        self.assertEqual(str(error), "OpenAI Responses request failed")
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+        self.assertNotIn(secret, "".join(traceback.format_exception(error)))
 
     def test_duplicate_durable_delivery_and_wrong_sha_are_rejected(self):
         record = DurableReviewRecord("AI_APPROVED", "run", "review", 1, self.head, "approved")
