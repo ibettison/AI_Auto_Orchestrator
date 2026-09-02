@@ -1,0 +1,20 @@
+{
+  "repository": "ibettison/AI_Auto_Orchestrator",
+  "repository_path": "/opt/ai-orchestrator/app",
+  "base_branch": "main",
+  "allowed_paths": [
+    "orchestrator",
+    "tests",
+    "README.md",
+    "pyproject.toml"
+  ],
+  "required_checks": [
+    ["python3", "-m", "unittest", "discover", "-v"]
+  ],
+  "risk": "green",
+  "max_cycles": 2,
+  "codex_timeout_seconds": 1200,
+  "check_timeout_seconds": 300,
+  "max_output_bytes": 131072,
+  "max_diff_bytes": 262144
+}

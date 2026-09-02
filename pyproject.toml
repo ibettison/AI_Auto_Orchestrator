@@ -7,12 +7,13 @@ name = "ai-auto-orchestrator"
 version = "0.1.0"
 description = "Offline coordination contract and deterministic state-machine simulator"
 requires-python = ">=3.11"
-dependencies = ["openai>=1.68.0"]
+dependencies = ["openai>=1.68.0", "openai-codex==0.147.0"]
 
 [project.scripts]
 orchestrator-sim = "orchestrator.simulator:main"
 orchestrator-live-review = "orchestrator.live_review:main"
 orchestrator-prepare-live-review = "orchestrator.prepare_live_review:main"
+orchestrator-run-objective = "orchestrator.objective_runner:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

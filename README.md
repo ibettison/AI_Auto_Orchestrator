@@ -1,8 +1,25 @@
-# AI Auto Orchestrator — Slice D
+# AI Auto Orchestrator — O-06 Stage 1
 
 Slice D adds the opt-in live OpenAI Responses API transport to the independent, SHA-bound reviewer and bounded review/fix loop from Slice C. The architecture is:
 
 `Objective → bounded Codex runner → validation → immutable diff → independent reviewer → bounded fix/re-review loop → AI approved OR human decision required`
+
+O-06 Stage 1 connects those contracts into one real, single-objective CLI. It creates a branch and PR, independently reviews the actual immutable PR head, applies at most the configured number of bounded fixes, and re-reviews every changed head. It never merges or deploys.
+
+## Single-objective runner
+
+Install the trusted repository profile from `examples/objective-profile.json` at a root-managed location, adjust its repository path and exact allowlists, then invoke:
+
+```bash
+orchestrator-run-objective \
+  --objective 'Add a persistent local audit log for AI review results' \
+  --profile /opt/ai-orchestrator/config/objective-profile.json \
+  --state-dir /opt/ai-orchestrator/state/objective-runs
+```
+
+The runner requires the source checkout to be clean, fetches the configured base branch, creates an isolated clone and run branch, invokes the official `openai-codex` SDK in `workspace_write`, runs only exact profile-allowlisted checks, commits only allowed paths, pushes, and opens a PR. The SDK package includes its pinned Codex runtime, so a separately installed global Codex CLI is not required. If `OPENAI_API_KEY` is used, it is supplied through the SDK login method and removed before the agent turn; it is not inherited by commands in the Codex workspace.
+
+Each run has a `0700` state directory, exclusive filesystem lease, append-only `0600` JSONL journal, and atomic terminal result. An incomplete prior run and a reused terminal run ID both fail closed. Review comments identify the exact reviewed head and cycle on the PR. Any stale/changed head, invalid review, failed check, out-of-scope edit, symlink, repeated finding, RED risk, timeout, provider failure, or exhausted cycle enters `human_decision_required`. Approval enters `human_merge_approval_required`; it does not merge.
 
 ## Run offline
 
@@ -19,7 +36,7 @@ The suite uses temporary local Git repositories, `FakeCodexAdapter`, and fake re
 
 `CommandPolicy` requires an exact allowlisted argv tuple, rejects shell wrappers and shell composition tokens, and uses `shell=False`. `PathPolicy` compares the before/after workspace inventory and rejects traversal, symlink changes, and out-of-scope files. `EnvironmentPolicy` constructs a new allowlisted environment rather than inheriting the parent environment. The runner records every required check, fails closed when one is not executed successfully, and sets `validation_passed` only after all required checks pass. `RunnerResult` contains bounded, untrusted output summaries, exit status, changed files, attempted checks, validation status, timestamps, duration, workspace/branch identity, failure reason, and structured audit records.
 
-The `CodexAdapter` protocol isolates the future CLI invocation detail. Slice B provides only `FakeCodexAdapter`, executed in a dedicated killable process so an adapter that never calls `commands.run()` cannot retain the lease or workspace past the overall deadline. Adapter timeout handling also terminates active command process groups. The parent drains adapter IPC while the worker is running, and command plus adapter output share one hard aggregate cap. `commands_executed` retains commands that started, with statuses for successful completion, non-zero exit, timeout, and output-limit termination; only completed zero-exit required checks can pass validation. An in-process, thread-safe `RunLeaseRegistry` rejects competing attempts for the same run ID. Durable leases and crash recovery belong to a later persistence/bridge slice.
+The `CodexAdapter` protocol underlies the offline test harness. Slice B provides `FakeCodexAdapter`, executed in a dedicated killable process so an adapter that never calls `commands.run()` cannot retain the lease or workspace past the overall deadline. O-06 adds the live SDK executor and durable filesystem lease around the end-to-end objective run.
 
 ## Security boundaries
 
@@ -101,4 +118,4 @@ Slice C does not authorise production execution. It does not connect to LayMatch
 
 ## Deliberate limitations
 
-This repository is not a production executor. It does not implement autonomous merging, sophisticated container resource isolation, durable leases, persisted audit logs, live GitHub mutation, or a real Codex CLI adapter. Oversized review input is rejected rather than silently chunked. Those capabilities require explicit deployment controls and a separate activation decision.
+Stage 1 is a bounded single-worker PR executor, not an autonomous production deployer. It does not implement automatic merge, deployment, parallel workers, automatic EC2 wake/stop, or sophisticated container resource isolation. Oversized review input is rejected rather than silently chunked. Installation and live commissioning remain separate explicit decisions.

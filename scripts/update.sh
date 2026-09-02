@@ -87,9 +87,10 @@ cp -a "$VENV_BACKUP" "$VENV_DIR" || fail
 # OpenAI credential to installation, tests, imports, or CLI checks.
 env -u OPENAI_API_KEY "$VENV_DIR/bin/python" -m pip install --upgrade "$WORKTREE_DIR" >/dev/null || fail
 (cd "$WORKTREE_DIR" && env -u OPENAI_API_KEY "$VENV_DIR/bin/python" -m unittest discover -v) || fail
-(cd "$WORKTREE_DIR" && env -u OPENAI_API_KEY "$VENV_DIR/bin/python" -c 'import openai; import orchestrator.live_review; import orchestrator.prepare_live_review') || fail
+(cd "$WORKTREE_DIR" && env -u OPENAI_API_KEY "$VENV_DIR/bin/python" -c 'import openai; import openai_codex; import orchestrator.live_review; import orchestrator.prepare_live_review; import orchestrator.objective_runner') || fail
 (cd "$WORKTREE_DIR" && env -u OPENAI_API_KEY "$VENV_DIR/bin/orchestrator-live-review" --help) || fail
 (cd "$WORKTREE_DIR" && env -u OPENAI_API_KEY "$VENV_DIR/bin/orchestrator-prepare-live-review" --help) || fail
+(cd "$WORKTREE_DIR" && env -u OPENAI_API_KEY "$VENV_DIR/bin/orchestrator-run-objective" --help) || fail
 
 git -C "$SOURCE_DIR" switch --detach "$target_sha" >/dev/null || fail
 [[ "$(git -C "$SOURCE_DIR" rev-parse HEAD)" == "$target_sha" ]] || fail
