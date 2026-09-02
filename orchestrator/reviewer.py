@@ -11,12 +11,16 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
+
+import fcntl
 
 from .contract import EventType, State
 from .runner import RunnerResult
@@ -47,11 +51,47 @@ class Severity(StrEnum):
 
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _MAX_TEXT = 4096
+_MAX_PROVIDER_METADATA_ENTRIES = 16
+_MAX_PROVIDER_METADATA_KEY = 64
+_MAX_PROVIDER_METADATA_TEXT = 512
+_MAX_PROVIDER_METADATA_BYTES = 4096
+_MAX_PROVIDER_METADATA_DEPTH = 2
 
 
 def _bounded(value: Any, limit: int = _MAX_TEXT) -> str:
-    return str(value).replace("\x00", " ").replace("\r", " ").replace("\n", " ")[:limit]
+    return str(value).replace("\\x00", " ").replace("\\r", " ").replace("\\n", " ")[:limit]
 
+
+def _bounded_provider_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and copy provider metadata within explicit persistence bounds."""
+
+    def normalize(item: Any, depth: int) -> Any:
+        if isinstance(item, Mapping):
+            if depth > _MAX_PROVIDER_METADATA_DEPTH or len(item) > _MAX_PROVIDER_METADATA_ENTRIES:
+                raise ReviewError("provider metadata exceeds structural bounds")
+            normalized = {}
+            for key, child in item.items():
+                if not isinstance(key, str) or not key or len(key) > _MAX_PROVIDER_METADATA_KEY:
+                    raise ReviewError("provider metadata key exceeds bounds")
+                normalized[key] = normalize(child, depth + 1)
+            return normalized
+        if item is None or isinstance(item, (bool, int)):
+            return item
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ReviewError("provider metadata contains a non-finite number")
+            return item
+        if isinstance(item, str):
+            if len(item) > _MAX_PROVIDER_METADATA_TEXT:
+                raise ReviewError("provider metadata text exceeds bounds")
+            return item
+        raise ReviewError("provider metadata contains an unsupported value")
+
+    normalized = normalize(value, 0)
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+    if len(encoded) > _MAX_PROVIDER_METADATA_BYTES:
+        raise ReviewError("provider metadata exceeds serialized size bound")
+    return normalized
 
 @dataclass(frozen=True)
 class Finding:
@@ -144,6 +184,78 @@ class ReviewResult:
             raise ReviewError("human verdict must require a human")
         if self.verdict == Verdict.REVIEW_FAILED:
             raise ReviewError("review failure is not an approval")
+
+
+class ReviewAuditLog:
+    """Persist validated review results as durable, append-oriented local JSONL."""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        if not self.path.is_absolute():
+            raise ReviewError("review audit log path must be absolute")
+
+    def append(self, request: ReviewRequest, result: ReviewResult) -> None:
+        result.validate_against(request)
+        record = {
+            "schema_version": self.SCHEMA_VERSION,
+            "recorded_at": datetime.now(UTC).isoformat(),
+            "run_id": request.run_id,
+            "review_id": result.review_id,
+            "cycle": request.cycle,
+            "base_sha": request.base_sha,
+            "reviewed_head_sha": result.reviewed_head_sha,
+            "diff_digest": request.diff_digest,
+            "verdict": result.verdict.value,
+            "risk": result.risk,
+            "requires_human": result.requires_human,
+            "summary": result.summary,
+            "findings": [
+                {
+                    "finding_id": finding.finding_id,
+                    "severity": finding.severity.value,
+                    "title": finding.title,
+                    "description": finding.description,
+                    "path": finding.path,
+                    "line": finding.line,
+                    "category": finding.category,
+                    "remediation": finding.remediation,
+                    "fingerprint": finding.fingerprint(),
+                }
+                for finding in result.findings
+            ],
+            "provider_metadata": _bounded_provider_metadata(result.provider_metadata),
+        }
+        try:
+            encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        except (TypeError, ValueError):
+            raise ReviewError("review audit record is not JSON serializable") from None
+
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except OSError:
+            raise ReviewError("review audit log could not be opened safely") from None
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ReviewError("review audit log must be a regular file with one link")
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written < 1:
+                    raise ReviewError("review audit record could not be written")
+                view = view[written:]
+            os.fsync(descriptor)
+        except OSError:
+            raise ReviewError("review audit record could not be persisted") from None
+        finally:
+            os.close(descriptor)
 
 
 class ReviewInputPreparer:

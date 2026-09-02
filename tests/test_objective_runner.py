@@ -136,6 +136,10 @@ def check_approved_exact_sha_stops_for_human_merge(tmp_path):
     events = [json.loads(line) for line in (tmp_path / "state/run-1/events.jsonl").read_text().splitlines()]
     changeset = next(item for item in events if item["event"] == "CHANGESET_VALIDATED")
     assert changeset["details"]["paths"] == ["src/app.txt"]
+    reviews = [json.loads(line) for line in (tmp_path / "state/run-1/reviews.jsonl").read_text().splitlines()]
+    assert reviews[0]["verdict"] == "approved"
+    assert reviews[0]["reviewed_head_sha"] == outcome.head_sha
+    assert reviews[0]["diff_digest"] == reviewer.requests[0].diff_digest
     assert not (tmp_path / "state/run-1/workspace").exists()
 
 
