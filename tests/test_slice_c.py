@@ -228,6 +228,49 @@ class SliceCTests(unittest.TestCase):
         with self.assertRaises(ProviderFailure):
             unavailable.review(request)
 
+    def test_live_sdk_transport_uses_runtime_secret_and_preserves_controls(self):
+        request = self.request()
+        captured = {}
+
+        class Usage:
+            input_tokens = 3
+            output_tokens = 4
+            total_tokens = 7
+
+        class Response:
+            status = "completed"
+            usage = Usage()
+            output_text = json.dumps({"review_id": request.review_id, "reviewed_head_sha": request.head_sha, "verdict": "approved", "findings": [], "summary": "ok", "risk": "green", "requires_human": False})
+
+        class Responses:
+            def create(self, **body):
+                captured.update(body=body)
+                return Response()
+
+        class Client:
+            responses = Responses()
+
+        def factory(api_key, timeout):
+            captured.update(api_key=api_key, timeout=timeout)
+            return Client()
+
+        reviewer = OpenAIResponsesReviewer.from_environment(
+            {"OPENAI_API_KEY": "runtime-secret", "OPENAI_REVIEWER_MODEL": "gpt-test", "OPENAI_REVIEWER_TIMEOUT_SECONDS": "9.5"},
+            client_factory=factory,
+        )
+        result = reviewer.review(request)
+        self.assertEqual(result.verdict, Verdict.APPROVED)
+        self.assertEqual((captured["api_key"], captured["timeout"], captured["body"]["model"]), ("runtime-secret", 9.5, "gpt-test"))
+        self.assertNotIn("runtime-secret", json.dumps(captured["body"]))
+        self.assertNotIn("tools", captured["body"])
+        self.assertEqual(captured["body"]["store"], False)
+        self.assertEqual(captured["body"]["text"]["format"]["schema"], REVIEW_JSON_SCHEMA)
+        self.assertEqual(captured["body"]["max_output_tokens"], 2048)
+
+    def test_live_configuration_requires_all_runtime_settings(self):
+        with self.assertRaises(ReviewError):
+            OpenAIResponsesReviewer.from_environment({}, client_factory=lambda *_: None)
+
     def test_duplicate_durable_delivery_and_wrong_sha_are_rejected(self):
         record = DurableReviewRecord("AI_APPROVED", "run", "review", 1, self.head, "approved")
         github = FakeGitHubCoordinator()
