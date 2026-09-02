@@ -1,40 +1,71 @@
-# AI Auto Orchestrator — Slice A
+# AI Auto Orchestrator — Slice D
 
-This repository is an independent, offline reference implementation for coordinating AI development work. It defines a versioned `loop/v1` event contract and a deterministic state machine. It has no provider, network, repository, webhook, email, production, or automation integration.
+Slice D adds the opt-in live OpenAI Responses API transport to the independent, SHA-bound reviewer and bounded review/fix loop from Slice C. The architecture is:
 
-## Contract
+`Objective → bounded Codex runner → validation → immutable diff → independent reviewer → bounded fix/re-review loop → AI approved OR human decision required`
 
-Events are append-only JSON-compatible records containing `event_id`, `event_type`, `run_id`, `sequence`, `expected_version`, `source_sha`, `idempotency_key`, and `payload`. A snapshot is derived only by applying valid events. `expected_version` provides optimistic concurrency; `sequence`, `source_sha`, and `run_id` reject stale or misrouted events. Repeating an event ID or idempotency key is a no-op.
-
-Payloads are recursively frozen when an event is constructed, so caller mutations cannot rewrite retained history or change replay results. `Event.to_dict()` returns a JSON-compatible copy.
-
-States are `planned → implementing → reviewing → complete`, with ordinary findings taking an automatic `fixing → reviewing` loop. RED conditions and exhausted review budgets enter `human_decision_required`; explicit `blocked/recovery` paths are fail-closed. Review findings consume a bounded cycle budget (default two). Human decisions support `approve_fix`, `approve_red_action`, and `stop`; generic fix approval cannot satisfy a RED gate.
-
-Risk is deterministic: GREEN means tests pass with no scope or external side effect; AMBER means test/scope uncertainty or a human-approved fix; RED means destructive/external side effects without approval, or an explicit human stop. RED is carried durably in the snapshot until `approve_red_action` is applied.
-
-## Run it offline
+## Run offline
 
 ```bash
 python3 -m unittest discover -v
 python3 -m orchestrator.simulator --scenario all
 ```
 
-## LayMatched example profile
+The suite uses temporary local Git repositories, `FakeCodexAdapter`, and fake reviewer transports; it makes no network calls and requires no provider credential.
 
-The profile below is deliberately descriptive only. It does not connect to, inspect, or modify LayMatched.
+## Runner architecture
 
-```json
-{
-  "profile": "laymatched-example",
-  "source_sha": "sha256:example-input",
-  "scope": "documentation-only change",
-  "risk": "green",
-  "human_gate": "required when scope changes or an external side effect is proposed",
-  "max_review_cycles": 2,
-  "providers": []
-}
+`RunnerConfig` is the bounded objective contract: run ID, repository, exact source SHA, permitted paths, exact allowed argv commands, an explicit non-empty `required_checks` list, objective, timeouts, output/command limits, explicit environment, network request, and review-cycle limit. `WorkspaceManager` rejects a dirty source checkout, verifies the SHA, clones it without hardlinks, creates a dedicated branch in the temporary clone, and always cleans up. The source checkout is never used as the worker directory.
+
+`CommandPolicy` requires an exact allowlisted argv tuple, rejects shell wrappers and shell composition tokens, and uses `shell=False`. `PathPolicy` compares the before/after workspace inventory and rejects traversal, symlink changes, and out-of-scope files. `EnvironmentPolicy` constructs a new allowlisted environment rather than inheriting the parent environment. The runner records every required check, fails closed when one is not executed successfully, and sets `validation_passed` only after all required checks pass. `RunnerResult` contains bounded, untrusted output summaries, exit status, changed files, attempted checks, validation status, timestamps, duration, workspace/branch identity, failure reason, and structured audit records.
+
+The `CodexAdapter` protocol isolates the future CLI invocation detail. Slice B provides only `FakeCodexAdapter`, executed in a dedicated killable process so an adapter that never calls `commands.run()` cannot retain the lease or workspace past the overall deadline. Adapter timeout handling also terminates active command process groups. The parent drains adapter IPC while the worker is running, and command plus adapter output share one hard aggregate cap. `commands_executed` retains commands that started, with statuses for successful completion, non-zero exit, timeout, and output-limit termination; only completed zero-exit required checks can pass validation. An in-process, thread-safe `RunLeaseRegistry` rejects competing attempts for the same run ID. Durable leases and crash recovery belong to a later persistence/bridge slice.
+
+## Security boundaries
+
+Network access is denied by default. A request for network access is rejected because this portable Python runner cannot provide a hard network sandbox. Application policy is not a substitute for OS/container isolation. Before any production use, the execution environment must supply process, filesystem, network, resource, credential, and identity isolation.
+
+The command and path policies are intentionally fail closed. They are policy checks around a development worker, not a security boundary against a compromised kernel, interpreter, dependency, or host. No unrestricted shell, shell wrapper, production credentials, or automatic merge capability is provided.
+
+## Slice A integration
+
+`RunnerCoordinator` emits `START`, runs the bounded adapter, then emits `IMPLEMENTED` with trusted `tests_pass=true` only when the runner completed and all required checks passed. Otherwise it emits `RUNNER_FAILED` and enters Slice A's blocked state. Adapter stdout/stderr is never copied into trusted state-machine fields. Existing immutable events, idempotency, source-SHA protection, optimistic concurrency, durable RED gates, bounded reviews, human escalation, and deterministic replay remain unchanged. Slice C's independent reviewer can consume the reviewing state later; it is deliberately not implemented here.
+
+## Simulator scenarios
+
+`--scenario all` includes Slice A GREEN/AMBER/RED paths plus Slice B runner GREEN, command failure, timeout/process termination, and out-of-scope modification scenarios. Each runner scenario uses a throwaway local repository and cleans it up.
+
+## Reviewer boundary
+
+`ReviewInputPreparer` resolves exact Git base and head commits and binds the actual untruncated `base...head` diff to a SHA-256 digest. `ReviewRequest` carries the objective, repository, both SHAs, diff, validation evidence, risk context, and cycle. `ReviewResult` uses bounded verdict/severity enums and is validated before it can affect the state machine. An approval for one head is never valid for another; a changed head during review is escalated.
+
+`ReviewFixLoop` uses the deterministic Slice A reducer, records durable-review-shaped events through `FakeGitHubCoordinator`, limits cycles, fingerprints equivalent findings, and escalates repeated findings, malformed results, provider failures, ambiguous decisions, and RED risk. Slice B validation results now carry the run ID, exact validated head SHA, and review diff digest; both the initial implementation and every fix must match those immutable bindings before state transitions. Repository/diff text is explicitly untrusted data. The `OpenAIResponsesReviewer` uses Structured Outputs with `REVIEW_JSON_SCHEMA`, `store=false`, an explicitly configured model, bounded output tokens, a request timeout, and no tools. The reviewer has no execution capability.
+
+## Slice D live review
+
+The live transport uses the official `openai` Python SDK and the Responses API `client.responses.create(...)`. It is opt-in and requires all of these runtime settings:
+
+```bash
+export OPENAI_API_KEY='provided by the host secret manager'
+export OPENAI_REVIEWER_MODEL='your-approved-model-id'
+export OPENAI_REVIEWER_TIMEOUT_SECONDS='30'
 ```
 
-## Scope and limitations
+Set these in the AWS orchestration host's runtime secret/configuration mechanism. Do not put the API key in Git, a request JSON file, command arguments, logs, or durable review metadata. The SDK call is made with `store=false`, the existing strict JSON Schema, no `tools` field, and `max_output_tokens=2048`. Missing configuration, SDK/provider errors, timeouts, incomplete responses, malformed JSON, schema/identity mismatches, and validation errors fail closed into the existing human-decision path.
 
-Persistence, authentication, permissions, real Git operations, provider adapters, and production execution are intentionally out of scope for Slice A. A caller owns durable storage and must retain the event log for replay/recovery. The in-memory implementation is a contract simulator, not a production coordinator.
+For manual commissioning after merge, prepare a JSON file containing one validated `ReviewRequest` (including its exact immutable SHAs and `diff_digest`) and invoke:
+
+```bash
+OPENAI_API_KEY="$OPENAI_API_KEY" \
+OPENAI_REVIEWER_MODEL='your-approved-model-id' \
+OPENAI_REVIEWER_TIMEOUT_SECONDS='30' \
+python3 -m orchestrator.live_review --request-json /secure/path/review-request.json
+```
+
+The command performs one review only. It does not run commands, expose tools to the reviewer, mutate GitHub, merge, deploy, or automatically apply fixes. On any failure it prints only `live review failed closed`; it never prints the API key.
+
+Slice C does not authorise production execution. It does not connect to LayMatched, OpenAI, GitHub mutation APIs, credentials, Stripe, email, DNS, databases, webhooks, CI, or external providers. Production deployment would still require a durable external orchestrator/bridge, separated GitHub App/token identities, secret management, hard network/container isolation, real provider credentials, persistence/durable leases, monitoring, and an explicit production approval path. This repository alone cannot wake or control an existing ChatGPT conversation.
+
+## Deliberate limitations
+
+This repository is not a production executor. It does not implement autonomous merging, sophisticated container resource isolation, durable leases, persisted audit logs, live GitHub mutation, or a real Codex CLI adapter. Oversized review input is rejected rather than silently chunked. Those capabilities require explicit deployment controls and a separate activation decision.
