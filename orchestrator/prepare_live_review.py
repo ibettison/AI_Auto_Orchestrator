@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import asdict
@@ -13,7 +14,7 @@ from typing import Any, Mapping
 from .reviewer import ReviewInputPreparer, ReviewRequest
 
 
-_OPENAI_SECRET_FILE = Path("/opt/ai-orchestrator/secrets/openai.env")
+_OPENAI_SECRET_DIRECTORY = Path("/opt/ai-orchestrator/secrets")
 
 
 def _repository_is_clean(repository: Path) -> bool:
@@ -33,6 +34,19 @@ def _evidence(value: str) -> Mapping[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("validation evidence must be a JSON object")
     return parsed
+
+
+def _write_request(output: Path, request: ReviewRequest) -> None:
+    payload = json.dumps(asdict(request), indent=2, sort_keys=True) + "\n"
+    file_descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(file_descriptor, 0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+            file_descriptor = -1
+            stream.write(payload)
+    finally:
+        if file_descriptor != -1:
+            os.close(file_descriptor)
 
 
 def prepare_request(args: argparse.Namespace) -> ReviewRequest:
@@ -69,10 +83,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         output = args.output.resolve()
-        if output == _OPENAI_SECRET_FILE:
-            raise ValueError("refusing to write the OpenAI secret file")
+        if output == _OPENAI_SECRET_DIRECTORY or output.is_relative_to(_OPENAI_SECRET_DIRECTORY):
+            raise ValueError("refusing to write beneath the OpenAI secrets directory")
         request = prepare_request(args)
-        output.write_text(json.dumps(asdict(request), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _write_request(output, request)
         return 0
     except Exception:
         print("live-review request preparation failed closed", file=sys.stderr)
