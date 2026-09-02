@@ -50,6 +50,7 @@ class LiveReviewPreparationTests(unittest.TestCase):
         self.assertEqual((request["base_sha"], request["head_sha"], request["review_id"]), (self.base, self.head, "commission-review"))
         self.assertEqual(request["diff_digest"], hashlib.sha256(request["diff"].encode()).hexdigest())
         self.assertEqual(request["validation_evidence"], {"passed": True})
+        self.assertEqual(self.output.stat().st_mode & 0o777, 0o600)
 
     def test_dirty_worktree_fails_closed_without_overwriting_output(self):
         self.output.write_text("sentinel\n", encoding="utf-8")
@@ -63,9 +64,14 @@ class LiveReviewPreparationTests(unittest.TestCase):
                 self.assertEqual(main(self.args(**{name: value})), 2)
                 self.assertFalse(self.output.exists())
 
-    def test_secret_file_is_never_an_output_target(self):
-        secret_path = Path("/opt/ai-orchestrator/secrets/openai.env")
-        self.assertEqual(main(self.args(**{"--output": str(secret_path)})), 2)
+    def test_any_path_beneath_secrets_directory_is_never_an_output_target(self):
+        for output in (
+            "/opt/ai-orchestrator/secrets/openai.env",
+            "/opt/ai-orchestrator/secrets/other-request.json",
+            "/opt/ai-orchestrator/secrets/nested/request.json",
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(main(self.args(**{"--output": output})), 2)
 
     def test_no_openai_secret_environment_is_needed(self):
         result = subprocess.run(
