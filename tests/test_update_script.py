@@ -25,7 +25,7 @@ class UpdateScriptTests(unittest.TestCase):
         (self.venv / "bin").mkdir(parents=True)
         self.python = self.venv / "bin" / "python"
         (self.venv / "runtime-version").write_text("previous\n", encoding="utf-8")
-        self.python.write_text("#!/bin/sh\ncase \"$*\" in\n  *'-m pip install'*) if [ \"${FAIL_INSTALL:-0}\" = 1 ]; then exit 17; fi; printf 'candidate\\n' > \"$(dirname \"$0\")/../runtime-version\"; exit 0 ;;\n  *'unittest discover'*) exit 23 ;;\n  *) exit 0 ;;\nesac\n", encoding="utf-8")
+        self.python.write_text("#!/bin/sh\ncase \"$*\" in\n  *'-m pip install'*) if [ \"${FAIL_INSTALL:-0}\" = 1 ]; then exit 17; fi; runtime_dir=\"$(dirname \"$0\")\"; printf 'candidate\\n' > \"$runtime_dir/../runtime-version\"; for command in orchestrator-live-review orchestrator-prepare-live-review; do printf '#!%s\\nexit 0\\n' \"$0\" > \"$runtime_dir/$command\"; chmod 755 \"$runtime_dir/$command\"; done; exit 0 ;;\n  *'unittest discover'*) if [ \"${FAIL_TEST:-0}\" = 1 ]; then exit 23; fi; exit 0 ;;\n  *) exit 0 ;;\nesac\n", encoding="utf-8")
         self.python.chmod(0o755)
 
     def tearDown(self):
@@ -55,7 +55,7 @@ class UpdateScriptTests(unittest.TestCase):
         result = subprocess.run(
             [str(self.repo / "scripts" / "update.sh"), "--revision", self.head],
             cwd=self.repo,
-            env={**os.environ, "AI_ORCHESTRATOR_VENV": str(self.venv)},
+            env={**os.environ, "AI_ORCHESTRATOR_VENV": str(self.venv), "FAIL_TEST": "1"},
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -64,6 +64,22 @@ class UpdateScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.head)
         self.assertEqual((self.venv / "runtime-version").read_text(encoding="utf-8"), "previous\n")
+
+    def test_promoted_console_scripts_use_final_python_and_execute(self):
+        result = subprocess.run(
+            [str(self.repo / "scripts" / "update.sh"), "--revision", self.head],
+            cwd=self.repo,
+            env={**os.environ, "AI_ORCHESTRATOR_VENV": str(self.venv)},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for command in ("orchestrator-live-review", "orchestrator-prepare-live-review"):
+            entry_point = self.venv / "bin" / command
+            self.assertEqual(entry_point.read_text(encoding="utf-8").splitlines()[0], f"#!{self.python}")
+            self.assertEqual(subprocess.run([str(entry_point), "--help"], check=False).returncode, 0)
 
 
 if __name__ == "__main__":
