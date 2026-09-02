@@ -42,7 +42,7 @@ _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SAFE_ENV = ("HOME", "PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_HOME")
 _GIT_PREFIX = ("git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false")
 _GIT_OPERATIONS = frozenset({
-    "add", "checkout", "clone", "commit", "config", "credential", "diff", "fetch", "push",
+    "add", "checkout", "clone", "commit", "config", "credential", "diff", "fetch", "ls-files", "push",
     "rev-parse", "status", "switch",
 })
 
@@ -401,10 +401,13 @@ class ObjectiveRunner:
     @staticmethod
     def _inventory(workspace: Path) -> dict[str, tuple[str, bool] | str]:
         values: dict[str, tuple[str, bool] | str] = {}
-        for path in workspace.rglob("*"):
-            if ".git" in path.parts:
+        # Git's index and ignore policy define commit candidates. Ignored runtime
+        # artifacts must never become objective changes or explicit add targets.
+        candidates = _git(workspace, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+        for relative in candidates.split("\x00"):
+            if not relative:
                 continue
-            relative = path.relative_to(workspace).as_posix()
+            path = workspace / relative
             if path.is_symlink():
                 values[relative] = "SYMLINK"
             elif path.is_file():
