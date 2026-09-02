@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ from orchestrator.objective_runner import (
     ObjectiveRunError,
     ObjectiveRunner,
     PullRequestIdentity,
+    _git,
 )
 from orchestrator.reviewer import Finding, ReviewResult, Severity, Verdict
 
@@ -242,6 +244,16 @@ def check_pr_head_is_owner_qualified_and_verified(_tmp_path):
             client.create_pr(Path("/tmp"), "owner/repo", "codex/run-1", "main", "title", "body")
 
 
+def check_git_subprocess_excludes_ambient_secrets(tmp_path):
+    completed = subprocess.CompletedProcess(["git", "status"], 0, stdout="", stderr="")
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "must-not-reach-git"}):
+        with patch("subprocess.run", return_value=completed) as run:
+            _git(tmp_path, "status")
+    child_environment = run.call_args.kwargs["env"]
+    assert "OPENAI_API_KEY" not in child_environment
+    assert set(child_environment).issubset({"HOME", "PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "CODEX_HOME"})
+
+
 def check_terminal_run_id_cannot_be_reused(tmp_path):
     source = source_repo(tmp_path)
     runner = ObjectiveRunner(EditingCodex([change_app("implemented\n")]), CallableReviewer(approved), FakeGitHub())
@@ -303,6 +315,9 @@ class TestObjectiveRunner(unittest.TestCase):
 
     def test_pr_head_is_owner_qualified_and_verified(self):
         self.invoke(check_pr_head_is_owner_qualified_and_verified)
+
+    def test_git_subprocess_excludes_ambient_secrets(self):
+        self.invoke(check_git_subprocess_excludes_ambient_secrets)
 
     def test_terminal_run_id_cannot_be_reused(self):
         self.invoke(check_terminal_run_id_cannot_be_reused)

@@ -50,6 +50,10 @@ def _bounded(value: object, limit: int = 2048) -> str:
     return str(value).replace("\x00", " ").replace("\r", " ").replace("\n", " ")[:limit]
 
 
+def _safe_environment() -> dict[str, str]:
+    return {key: os.environ[key] for key in _SAFE_ENV if key in os.environ}
+
+
 def _run(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None,
          timeout: float = 30, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     try:
@@ -66,7 +70,7 @@ def _run(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None
 
 
 def _git(cwd: Path, *args: str, timeout: float = 30) -> str:
-    return _run(("git", *args), cwd=cwd, timeout=timeout).stdout.strip()
+    return _run(("git", *args), cwd=cwd, env=_safe_environment(), timeout=timeout).stdout.strip()
 
 
 @dataclass(frozen=True)
@@ -220,7 +224,7 @@ class CodexSdkExecutor:
     """Official Codex SDK executor, isolated in a killable process group."""
 
     def execute(self, prompt: str, workspace: Path, profile: ObjectiveProfile) -> CodexResult:
-        environment = {key: os.environ[key] for key in _SAFE_ENV if key in os.environ}
+        environment = _safe_environment()
         api_key = os.environ.get("OPENAI_API_KEY")
         receiver, sender = multiprocessing.get_context("fork").Pipe(False)
         process = multiprocessing.get_context("fork").Process(
@@ -276,7 +280,7 @@ class GitHubAppClient:
     def _credential(workspace: Path) -> tuple[str, str]:
         result = _run(
             ("git", "credential", "fill"), cwd=workspace,
-            input_text="protocol=https\nhost=github.com\n\n", timeout=30,
+            env=_safe_environment(), input_text="protocol=https\nhost=github.com\n\n", timeout=30,
         )
         values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
         if not values.get("username") or not values.get("password"):
@@ -358,7 +362,8 @@ class ObjectiveRunner:
         workspace = run.run_dir / "workspace"
         if workspace.exists():
             raise ObjectiveRunError("workspace already exists")
-        _run(("git", "clone", "--no-local", str(source), str(workspace)), cwd=run.run_dir, timeout=120)
+        _run(("git", "clone", "--no-local", str(source), str(workspace)), cwd=run.run_dir,
+             env=_safe_environment(), timeout=120)
         branch = f"codex/{run_id}"
         _git(workspace, "checkout", "--detach", base_sha)
         _git(workspace, "switch", "-c", branch)
@@ -387,7 +392,7 @@ class ObjectiveRunner:
     @staticmethod
     def _checks(workspace: Path, profile: ObjectiveProfile, run: DurableRun) -> Mapping[str, object]:
         audit: list[dict[str, str]] = []
-        environment = {key: os.environ[key] for key in _SAFE_ENV if key in os.environ}
+        environment = _safe_environment()
         command_runner = BoundedCommandRunner(
             workspace, CommandPolicy(profile.required_checks, len(profile.required_checks)), environment,
             profile.check_timeout_seconds, time.monotonic() + profile.check_timeout_seconds * len(profile.required_checks),
