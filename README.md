@@ -37,19 +37,19 @@ The command and path policies are intentionally fail closed. They are policy che
 
 ## AWS update/install procedure
 
-The supported update path is the idempotent `scripts/update.sh` command. Run it as the owner of the checkout and virtual environment; do not use a broad Git `safe.directory` exception or run it as root. It requires a clean source checkout, stages the selected exact revision in a temporary worktree, installs the project and declared dependencies into `/opt/ai-orchestrator/venv`, runs the complete test suite, verifies `openai`, `orchestrator.live_review`, and `orchestrator.prepare_live_review` imports, and only then advances the source checkout. Any fetch, install, test, import, or Git failure exits nonzero and reports failure closed. The update checks never read or pass `OPENAI_API_KEY` or `/opt/ai-orchestrator/secrets/openai.env`; they make no OpenAI call.
+The supported update path is the idempotent `/opt/ai-orchestrator/app/scripts/update.sh` command. Run it as the `orchestrator` owner of the checkout and virtual environment; do not use a broad Git `safe.directory` exception or run it as root. It requires a clean source checkout, stages the selected exact revision in a temporary worktree, copies the commissioned venv into a disposable validation venv, installs the project and declared dependencies there, runs the complete test suite, verifies `openai`, `orchestrator.live_review`, and `orchestrator.prepare_live_review` imports, and only then atomically promotes the validated venv and advances the source checkout. The previous venv is retained until the checkout advances and is restored if promotion or checkout fails. Any fetch, install, test, import, or Git failure exits nonzero and reports failure closed. The update checks never read or pass `OPENAI_API_KEY` or `/opt/ai-orchestrator/secrets/openai.env`; they make no OpenAI call.
 
 For an approved exact revision on the AWS orchestration host:
 
 ```bash
-sudo -u ai-orchestrator -- bash /opt/ai-orchestrator/scripts/update.sh \
+sudo -u orchestrator -- bash /opt/ai-orchestrator/app/scripts/update.sh \
   --revision '<exact-approved-commit-sha>'
 ```
 
 When the approved change is specifically the current remote `main` tip, use:
 
 ```bash
-sudo -u ai-orchestrator -- bash /opt/ai-orchestrator/scripts/update.sh --current-main
+sudo -u orchestrator -- bash /opt/ai-orchestrator/app/scripts/update.sh --current-main
 ```
 
 After the command succeeds, use the commissioning sequence below: prepare the request, manually inspect its immutable metadata, then run `live_review`. Do not place credentials in the request or update command.
