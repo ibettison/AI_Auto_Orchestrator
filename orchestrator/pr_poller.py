@@ -1056,7 +1056,7 @@ def poll_once(state_path: Path | None = None, log_path: Path | None = None, wake
             # Try OpenCode bridge first if available and no generic wake command, otherwise generic trigger
             # For dual-status, construct appropriate instruction via bridge
             triggered = False
-            status = new_watch.last_action_status
+            status = new_watch.state
             # Attempt opencode bridge if session is known or discoverable
             # We only use bridge when wake_command is not explicitly set to a different shell template,
             # or when wake_command looks like opencode bridge
@@ -1127,9 +1127,30 @@ def poll_once(state_path: Path | None = None, log_path: Path | None = None, wake
                     pass
                 _audit_log("wake triggered", extra={"repo": watch.repo, "pr": watch.pr, "sha": watch.expected_sha[:7], "status": status or "-"}, log_path=log_path)
             else:
-                _audit_log("wake not triggered (no command or failed)", level=logging.WARNING, extra={"repo": watch.repo, "pr": watch.pr}, log_path=log_path)
-                errors += 1
-
+                 # Wake failed: revert the wake recording to allow retry
+                 now = datetime.now(UTC).isoformat()
+                 recovered_watch = WatchRecord(
+                     repo=watch.repo,
+                     pr=watch.pr,
+                     expected_sha=watch.expected_sha,
+                     state=new_watch.state,  # review status (APPROVED or CHANGES_REQUIRED)
+                     created_at=watch.created_at,
+                     updated_at=now,
+                     last_observed_head_sha=new_watch.last_observed_head_sha,
+                     last_observed_github_state=new_watch.last_observed_github_state,
+                     last_observed_review_marker=new_watch.last_observed_review_marker,
+                     last_wake_sha=watch.last_wake_sha,
+                     wake_count=watch.wake_count,
+                     error_message=None,
+                     wake_command=watch.wake_command,
+                     last_action_status=watch.last_action_status,
+                     last_action_sha=watch.last_action_sha,
+                     opencode_session_id=new_watch.opencode_session_id,
+                 )
+                 updated_watches[key] = recovered_watch
+                 new_watch = recovered_watch
+                 _audit_log("wake not triggered (no command or failed)", level=logging.WARNING, extra={"repo": watch.repo, "pr": watch.pr}, log_path=log_path)
+                 # Do not increment errors for wake failure
         # Clean up terminal watches: MERGED, CLOSED, STALE can be kept for audit or removed?
         # We keep them but they will not be polled for wake again. They can be manually removed.
         # Optionally, we could auto-remove MERGED/CLOSED after some time, but for now keep.
