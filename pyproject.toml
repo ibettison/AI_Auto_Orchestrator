@@ -17,5 +17,9 @@ orchestrator-run-objective = "orchestrator.objective_runner:main"
 orchestrator-pr-watch = "orchestrator.pr_poller:main"
 orchestrator-pr-poller = "orchestrator.pr_poller:main"
 
+[tool.setuptools.packages.find]
+include = ["orchestrator*"]
+exclude = ["tests*", "systemd*", "docs*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
