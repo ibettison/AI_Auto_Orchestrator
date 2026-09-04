@@ -1,0 +1,42 @@
+# systemd service for LM-2nd GitHub PR polling — NOT YET INSTALLED
+# v1: timer → oneshot poll every ~60s (no long-running watch process)
+# Each invocation does exactly one deterministic poll via gh CLI and exits.
+# No OpenAI / model calls are made while WAITING_FOR_REVIEW — cost £0.
+#
+# Installation (manual, after review):
+#   sudo cp systemd/ai-auto-orchestrator-pr-poller.service /etc/systemd/system/
+#   sudo cp systemd/ai-auto-orchestrator-pr-poller.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ai-auto-orchestrator-pr-poller.timer
+#
+# Logs: journalctl -u ai-auto-orchestrator-pr-poller -f
+# State: ~/.local/share/ai-auto-orchestrator/pr_watches.json
+# Audit log: ~/.local/state/ai-auto-orchestrator/pr_poller.log
+# Timer log: systemctl list-timers ai-auto-orchestrator-pr-poller.timer
+
+[Unit]
+Description=AI Auto Orchestrator — GitHub PR review poller (oneshot poll, zero AI cost)
+Documentation=https://github.com/ibettison/AI_Auto_Orchestrator/blob/feature/opencode-github-auto-continue/docs/pr-poller.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Use the commissioned orchestrator venv — never pass OPENAI_API_KEY to the poller.
+Environment=AI_ORCHESTRATOR_VENV=/opt/ai-orchestrator/venv
+ExecStart=/opt/ai-orchestrator/venv/bin/orchestrator-pr-watch poll
+# Oneshot: service exits after one poll; timer re-invokes every 60s.
+# No Restart= needed — timer serializes invocations and avoids duplicates.
+# Security hardening — minimal ambient credentials, no secrets in logs.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/ai-auto-orchestrator %h/.local/state/ai-auto-orchestrator %h/.config/ai-auto-orchestrator
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-pr-poller
+# Do not include tokens in command line or environment logging.
+
+[Install]
+WantedBy=multi-user.target

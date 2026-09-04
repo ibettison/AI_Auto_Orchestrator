@@ -1,0 +1,31 @@
+# systemd timer for LM-2nd GitHub PR polling — NOT YET INSTALLED
+# Alternative to the long-running watch service: triggers a single poll every 60s.
+# This is the preferred initial behaviour (poll every 60s, cheap, no LLM).
+# The timer serializes executions and avoids duplicate watchers.
+#
+# Installation (manual, after review):
+#   sudo cp systemd/ai-auto-orchestrator-pr-poller.service /etc/systemd/system/
+#   sudo cp systemd/ai-auto-orchestrator-pr-poller.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ai-auto-orchestrator-pr-poller.timer
+#
+# To use timer mode, change the service ExecStart to:
+#   ExecStart=/opt/ai-orchestrator/venv/bin/orchestrator-pr-watch poll
+# and enable the timer instead of the service.
+#
+# Check: systemctl list-timers ai-auto-orchestrator-pr-poller.timer
+# Logs: journalctl -u ai-auto-orchestrator-pr-poller.service
+
+[Unit]
+Description=Run AI Auto Orchestrator PR poller every 60s (zero AI cost)
+Documentation=https://github.com/ibettison/AI_Auto_Orchestrator/blob/feature/opencode-github-auto-continue/docs/pr-poller.md
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=ai-auto-orchestrator-pr-poller.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
