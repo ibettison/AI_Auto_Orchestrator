@@ -14,6 +14,8 @@ orchestrator-sim = "orchestrator.simulator:main"
 orchestrator-live-review = "orchestrator.live_review:main"
 orchestrator-prepare-live-review = "orchestrator.prepare_live_review:main"
 orchestrator-run-objective = "orchestrator.objective_runner:main"
+orchestrator-pr-watch = "orchestrator.pr_poller:main"
+orchestrator-pr-poller = "orchestrator.pr_poller:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

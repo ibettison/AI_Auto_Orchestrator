@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
+from .review_marker import build_marker_from_review, post_marker_via_github_port
 from .reviewer import OpenAIResponsesReviewer, ReviewAuditLog, ReviewInputPreparer, ReviewResult, Severity, Verdict
 from .runner import BoundedCommandRunner, CommandPolicy, PathPolicy
 
@@ -547,6 +548,15 @@ class ObjectiveRunner:
                         "- Merge/deployment: **not performed**",
                     )),
                 )
+                # Also post deterministic machine-readable marker for the poller (exact SHA binding, no model prose).
+                # This is the producer for LAYMATCHED-AI-REVIEW — trusted code, exact SHA, verdict enum only.
+                try:
+                    marker = build_marker_from_review(profile.repository, pr_number, request, review)
+                    post_marker_via_github_port(self.github, workspace, profile.repository, pr_number, marker)
+                    run.append("REVIEW_MARKER_POSTED", cycle=cycle, head_sha=head_sha, verdict=review.verdict.value, pr_number=pr_number)
+                except Exception as exc:
+                    run.append("REVIEW_MARKER_FAILED", cycle=cycle, head_sha=head_sha, reason=str(type(exc).__name__))
+                    return self._terminal(run, "human_decision_required", "review marker post failed closed", run_id, branch, pr_number, pr_url, head_sha, cycle)
                 if review.risk == "red" or review.requires_human or review.verdict == Verdict.HUMAN_DECISION_REQUIRED:
                     return self._terminal(run, "human_decision_required", "review requires human decision", run_id, branch, pr_number, pr_url, head_sha, cycle)
                 if review.verdict == Verdict.APPROVED:
