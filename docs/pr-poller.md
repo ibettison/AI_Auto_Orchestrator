@@ -68,7 +68,7 @@ If discovery fails or verification fails, the poller fails closed (logs, no wake
 - **Poller:** `orchestrator.pr_poller` — stdlib + `gh` only. No `openai`, `boto3`, `sqs`, or LLM imports. Parsing is deterministic regex/string.
 - **Bridge:** `orchestrator.opencode_bridge` — session discovery, verify, `inject_fix`/`inject_merge`, persist session ID.
 - **CLI:** `orchestrator-pr-watch` (`orchestrator-pr-poller` alias) — `add`, `status`/`list`, `remove`, `poll`, `watch`.
-- **Service:** `systemd/ai-auto-orchestrator-pr-poller.service` (`Type=oneshot`, `ExecStart=.../orchestrator-pr-watch poll`) + `timer` (`OnBootSec=60`, `OnUnitActiveSec=60`, `AccuracySec=5s`) — NOT yet installed. Timer fires ~60s, runs one deterministic poll, exits; no long-running `watch` process between ticks. Serialized via systemd, no duplicate.
+- **Service:** `systemd/ai-auto-orchestrator-pr-poller.service` (`Type=oneshot`, `User=ec2-user`, `Group=ec2-user`, `ExecStartPre=+install -d ...`, `ExecStart=.../orchestrator-pr-watch poll`) + `timer` (`OnBootSec=60`, `OnUnitActiveSec=60`, `AccuracySec=5s`) — NOT yet installed. `User`/`Group` ensures `%h`/`HOME` resolves to `/home/ec2-user` so `gh` auth, OpenCode DB, and state under `/home/ec2-user/.local/*` are used. `ExecStartPre=+/usr/bin/install -d -o ec2-user -g ec2-user -m 0755` creates `/home/ec2-user/.local/share/ai-auto-orchestrator`, `/home/ec2-user/.local/state/ai-auto-orchestrator`, `/home/ec2-user/.config/ai-auto-orchestrator` with correct ownership before `ProtectSystem=strict`/`ProtectHome=read-only` namespacing. Timer fires ~60s, runs one deterministic poll, exits; no long-running `watch` process between ticks. Serialized via systemd, no duplicate.
 - **Marker producer:** `orchestrator/review_marker.py` + `objective_runner.py` integration — after each independent review, builds trusted `LAYMATCHED-AI-REVIEW` from `ReviewRequest.head_sha` (exact trusted SHA) + `ReviewResult.verdict` enum, posts via `GitHubPort.comment`. Model prose never grants merge.
 
 ## State Model
@@ -202,18 +202,35 @@ orchestrator-pr-watch add --repo owner/repo --pr 193 --sha <expected> --opencode
 #   gh api repos/<repo>/pulls/<pr>/reviews --paginate
 ```
 
-Service (NOT yet installed):
+Service (NOT yet installed) — runs explicitly as `ec2-user` to use its `gh` auth, OpenCode DB, and state:
 ```bash
 sudo cp systemd/ai-auto-orchestrator-pr-poller.service /etc/systemd/system/
 sudo cp systemd/ai-auto-orchestrator-pr-poller.timer /etc/systemd/system/
 sudo systemctl daemon-reload
+# Verify unit resolves to ec2-user before enabling:
+systemctl cat ai-auto-orchestrator-pr-poller.service | grep -E "^(User|Group|ReadWritePaths|ExecStartPre|ExecStart)="
+systemd-analyze verify ai-auto-orchestrator-pr-poller.service
+# Directory setup is automatic via ExecStartPre=+/usr/bin/install -d
+# (creates /home/ec2-user/.local/share/ai-auto-orchestrator,
+#  /home/ec2-user/.local/state/ai-auto-orchestrator,
+#  /home/ec2-user/.config/ai-auto-orchestrator as ec2-user:ec2-user 0755).
+# If creating manually, ensure ownership:
+#   sudo -u ec2-user install -d -m 0755 /home/ec2-user/.local/share/ai-auto-orchestrator \
+#     /home/ec2-user/.local/state/ai-auto-orchestrator \
+#     /home/ec2-user/.config/ai-auto-orchestrator
+# Do NOT create root-owned directories under /root — the service must use /home/ec2-user.
 sudo systemctl enable --now ai-auto-orchestrator-pr-poller.timer
 systemctl list-timers ai-auto-orchestrator-pr-poller.timer
 journalctl -u ai-auto-orchestrator-pr-poller -f
 cat ~/.local/share/ai-auto-orchestrator/pr_watches.json
 cat ~/.local/state/ai-auto-orchestrator/pr_poller.log
+# Verify runtime user/home and no root-owned files:
+#   systemctl show ai-auto-orchestrator-pr-poller.service -p User -p Group -p ReadWritePaths
+#   journalctl -u ai-auto-orchestrator-pr-poller.service -n 20 --no-pager
+#   ls -ld /home/ec2-user/.local/share/ai-auto-orchestrator /home/ec2-user/.local/state/ai-auto-orchestrator /home/ec2-user/.config/ai-auto-orchestrator
+#   ls -ld /root/.local/share/ai-auto-orchestrator /root/.local/state/ai-auto-orchestrator 2>&1 | head
 ```
-Service is `Type=oneshot`, `ExecStart=.../orchestrator-pr-watch poll` — runs one poll and exits; timer (`OnBootSec=60`, `OnUnitActiveSec=60`, `AccuracySec=5s`, `Persistent=true`) fires ~60s, serializes via systemd, no duplicate watch process between ticks. No `watch --interval` long-running process.
+Service is `Type=oneshot`, `User=ec2-user`, `Group=ec2-user`, `ExecStartPre=+/usr/bin/install -d -o ec2-user ...` (directory creation, privileged), `ExecStart=.../orchestrator-pr-watch poll` — runs one poll and exits; timer (`OnBootSec=60`, `OnUnitActiveSec=60`, `AccuracySec=5s`, `Persistent=true`) fires ~60s, serializes via systemd, no duplicate watch process between ticks. `ReadWritePaths` uses absolute `/home/ec2-user/...` so mount namespacing never touches `/root`. No `watch --interval` long-running process.
 
 ## Cost Safety
 
