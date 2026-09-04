@@ -426,39 +426,47 @@ def get_pr_state(repo: str, pr: int) -> dict[str, Any] | None:
         return None
 
 
-def get_pr_comments_and_reviews(repo: str, pr: int) -> list[str]:
-    """Fetch comment and review bodies for the PR. Returns list of texts. Fail closed -> empty list on error."""
+def get_pr_comments_and_reviews(repo: str, pr: int) -> list[str] | None:
+    """Fetch comment and review bodies for the PR. Returns list of texts or None on required-API failure (fail closed).
+
+    All three GitHub retrievals (issues/comments, pr view comments, pulls/reviews)
+    are required to succeed (rc==0 and valid JSON if non-empty). If any fails
+    or returns malformed JSON, returns None so the caller can mark ERROR and
+    not interpret it as 'no review'.
+    """
     texts: list[str] = []
+    ok = True
     # Comments via gh api: GET /repos/{owner}/{repo}/issues/{pr}/comments
-    # Reviews via gh api: GET /repos/{owner}/{repo}/pulls/{pr}/reviews
-    # We use gh api to avoid extra dependencies; each is one API call.
-    # First, comments
     rc, out, _ = _run_gh(
         ["api", f"repos/{repo}/issues/{pr}/comments", "--paginate"],
         timeout=15.0,
     )
-    if rc == 0 and out.strip():
+    if rc != 0:
+        ok = False
+    elif out.strip():
         try:
             data = json.loads(out)
-            # gh api --paginate with json output may be a single list or newline-delimited?
-            # When paginated, gh may output multiple JSON arrays concatenated. Handle both.
-            # Try to parse as JSON; if it fails, try to handle as concatenated arrays.
             if isinstance(data, list):
                 for item in data:
                     if isinstance(item, dict) and isinstance(item.get("body"), str):
                         texts.append(item["body"])
             elif isinstance(data, dict) and "body" in data:
                 texts.append(str(data["body"]))
+            else:
+                # Unexpected shape with data present — treat as malformed
+                if out.strip() not in ("[]", "{}", "null", ""):
+                    ok = False
         except (json.JSONDecodeError, TypeError):
-            # Fallback: try to extract bodies via regex for robustness, but fail closed if not parseable
-            pass
+            ok = False
 
     # Also fetch pr view comments field as fallback — gh pr view includes comments
     rc2, out2, _ = _run_gh(
         ["pr", "view", str(pr), "--repo", repo, "--json", "comments"],
         timeout=15.0,
     )
-    if rc2 == 0 and out2.strip():
+    if rc2 != 0:
+        ok = False
+    elif out2.strip():
         try:
             data2 = json.loads(out2)
             for c in data2.get("comments", []):
@@ -466,15 +474,17 @@ def get_pr_comments_and_reviews(repo: str, pr: int) -> list[str]:
                     body = c["body"]
                     if body not in texts:
                         texts.append(body)
-        except (json.JSONDecodeError, TypeError):
-            pass
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            ok = False
 
     # Reviews
     rc3, out3, _ = _run_gh(
         ["api", f"repos/{repo}/pulls/{pr}/reviews", "--paginate"],
         timeout=15.0,
     )
-    if rc3 == 0 and out3.strip():
+    if rc3 != 0:
+        ok = False
+    elif out3.strip():
         try:
             data3 = json.loads(out3)
             if isinstance(data3, list):
@@ -483,10 +493,14 @@ def get_pr_comments_and_reviews(repo: str, pr: int) -> list[str]:
                         body = item.get("body") or ""
                         if isinstance(body, str) and body:
                             texts.append(body)
-                        # Also check review state? But marker is in body
+            else:
+                if out3.strip() not in ("[]", "{}", "null", ""):
+                    ok = False
         except (json.JSONDecodeError, TypeError):
-            pass
+            ok = False
 
+    if not ok:
+        return None
     return texts
 
 
@@ -951,15 +965,43 @@ def poll_once(state_path: Path | None = None, log_path: Path | None = None, wake
         effective_wake = wake_command or watch.wake_command or _default_wake_command()
         # Fetch GitHub state — fail closed on error
         github_state = get_pr_state(watch.repo, watch.pr)
-        texts: list[str] = []
+        texts: list[str] | None = None
+        texts_failed = False
         if github_state is not None:
             texts = get_pr_comments_and_reviews(watch.repo, watch.pr)
+            if texts is None:
+                texts_failed = True
+                texts = []
+                errors += 1
+                _audit_log("GitHub comment/review retrieval failed for watch", level=logging.WARNING, extra={"repo": watch.repo, "pr": watch.pr}, log_path=log_path)
         else:
             errors += 1
             _audit_log("GitHub API failure for watch", level=logging.WARNING, extra={"repo": watch.repo, "pr": watch.pr}, log_path=log_path)
 
-        # Evaluate
-        new_watch, should_wake = evaluate_watch(watch, github_state, texts)
+        # Evaluate — if comment/review retrieval failed, force ERROR fail-closed (do not interpret as no review)
+        if texts_failed:
+            now = datetime.now(UTC).isoformat()
+            new_watch = WatchRecord(
+                repo=watch.repo,
+                pr=watch.pr,
+                expected_sha=watch.expected_sha,
+                state=WatchState.ERROR,
+                created_at=watch.created_at,
+                updated_at=now,
+                last_observed_head_sha=watch.last_observed_head_sha,
+                last_observed_github_state=watch.last_observed_github_state,
+                last_observed_review_marker=watch.last_observed_review_marker,
+                last_wake_sha=watch.last_wake_sha,
+                wake_count=watch.wake_count,
+                error_message="GitHub comment/review API failure",
+                wake_command=watch.wake_command,
+                last_action_status=watch.last_action_status,
+                last_action_sha=watch.last_action_sha,
+                opencode_session_id=watch.opencode_session_id,
+            )
+            should_wake = False
+        else:
+            new_watch, should_wake = evaluate_watch(watch, github_state, texts if texts is not None else [])
         # Preserve wake_command and session id if not set
         if new_watch.wake_command is None and effective_wake:
             new_watch = WatchRecord(

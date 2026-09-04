@@ -115,6 +115,7 @@ F-002 ...
 - `PR` matches watched PR
 - `HEAD` matches watched `expected_sha` (lower-cased)
 - `current PR HEAD` (from `gh pr view headRefOid`) still equals that `HEAD`
+- **Both** GitHub retrievals (`pr view` state + `issues/comments` + `pulls/reviews`) must succeed with valid JSON; any failure or malformed response → `ERROR` (not `no review`), no wake, bounded log, retry next tick
 - If `HEAD` changed (`current HEAD != expected`) and PR is `OPEN` with valid new SHA → **auto-rebind**: watcher atomically updates `expected_sha` to new `headRefOid`, clears old marker/status, `WAITING_FOR_REVIEW`. No manual `add` needed; old review for A cannot approve B (exact-SHA check). Persisted and survives restart.
 - If not `OPEN` or invalid SHA → `STALE` fallback, no rebind, no wake.
 - New `HEAD` requires completely new independent review.
@@ -185,8 +186,8 @@ On exact-SHA `APPROVED`:
 - Bound at `add` time; every poll compares `lower()` to `headRefOid`.
 - `HEAD A→B` while `OPEN` → **auto-rebind** to B, `WAITING`, old marker not carried; `STALE` only fallback when not `OPEN`/invalid SHA.
 - `MERGED`/`CLOSED` → terminal, no wake.
-- `gh` failure → `ERROR`, no wake, recovers to `WAITING` on success.
-- Wake only when `STATUS` + `PR` + `HEAD` match `expected_sha` **and** `current HEAD == expected_sha`.
+- `gh` failure (PR state **or** comments/reviews API) → `ERROR`, no wake, bounded diagnostic, recovers to `WAITING` on next success. Partial marker source retrieval is not sufficient for permission-bearing decisions (fail closed).
+- Wake only when `STATUS` + `PR` + `HEAD` match `expected_sha` **and** `current HEAD == expected_sha` **and** both GitHub retrievals succeeded.
 - Whizzy double-checks before merge (including mergeability).
 
 ## How LM-2nd Should Run It (Polling, £0)

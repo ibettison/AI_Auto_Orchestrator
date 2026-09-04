@@ -656,6 +656,110 @@ class TestReviewMarkerProducer(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             post_marker_via_github_port(FailingPort(), Path("/tmp"), REPO, PR, "marker")
 
+    def test_fix_instruction_no_manual_add(self):
+        from orchestrator.opencode_bridge import build_fix_instruction
+        instr = build_fix_instruction(REPO, PR, SHA, ["F-001 test"])
+        self.assertNotIn("orchestrator-pr-watch add", instr)
+        self.assertIn("poller will automatically observe", instr)
+        self.assertIn("STOP/return to waiting", instr)
+
+
+class TestCommentFetchFailClosed(unittest.TestCase):
+    def test_pr_state_succeeds_comments_api_fails_produces_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                # Simulate comments API failure via get_pr_comments_and_reviews returning None
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=None):
+                    summary = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                    self.assertEqual(summary["woke"], 0)
+                    self.assertGreater(summary["errors"], 0)
+                    watches = load_watches(state_path)
+                    self.assertEqual(watches[watch.key()].state, WatchState.ERROR)
+                    self.assertIn("comment/review", watches[watch.key()].error_message or "")
+
+    def test_pr_state_succeeds_reviews_api_fails_produces_error(self):
+        # Same as above — get_pr_comments_and_reviews returning None covers both comments and reviews
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=None):
+                    poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                    watches = load_watches(state_path)
+                    self.assertEqual(watches[watch.key()].state, WatchState.ERROR)
+
+    def test_malformed_github_response_produces_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            # Mock _run_gh to return malformed JSON for pr view (but get_pr_state will handle it as None)
+            # Instead test comment fetch malformed: get_pr_comments_and_reviews returns None due to JSON error
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=None):
+                    summary = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                    self.assertEqual(summary["woke"], 0)
+                    watches = load_watches(state_path)
+                    self.assertEqual(watches[watch.key()].state, WatchState.ERROR)
+
+    def test_partial_marker_source_retrieval_produces_error(self):
+        # get_pr_comments_and_reviews internally would return None if any of 3 calls failed
+        # Simulate via mock returning None (partial)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=None):
+                    poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                    watches = load_watches(state_path)
+                    self.assertEqual(watches[watch.key()].state, WatchState.ERROR)
+
+    def test_successful_subsequent_poll_recovers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            # First poll fails via comment API
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=None):
+                    poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+            watches = load_watches(state_path)
+            self.assertEqual(watches[watch.key()].state, WatchState.ERROR)
+            # Second poll succeeds (no marker, should recover to WAITING)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[]):
+                    poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+            watches2 = load_watches(state_path)
+            self.assertEqual(watches2[watch.key()].state, WatchState.WAITING_FOR_REVIEW)
+
+    def test_get_pr_comments_returns_none_on_rc_failure(self):
+        # Directly test get_pr_comments_and_reviews fail-closed on gh failure
+        from orchestrator.pr_poller import get_pr_comments_and_reviews
+        with mock.patch("orchestrator.pr_poller._run_gh", return_value=(1, "", "error")):
+            result = get_pr_comments_and_reviews(REPO, PR)
+            self.assertIsNone(result)
+
+    def test_get_pr_comments_returns_none_on_malformed_json(self):
+        from orchestrator.pr_poller import get_pr_comments_and_reviews
+        # Simulate malformed JSON from first call
+        def fake_run(args, timeout=15.0):
+            if "issues" in " ".join(args):
+                return (0, "not-json", "")
+            return (0, "[]", "")
+        with mock.patch("orchestrator.pr_poller._run_gh", side_effect=fake_run):
+            result = get_pr_comments_and_reviews(REPO, PR)
+            self.assertIsNone(result)
+
 
 import hashlib
 
