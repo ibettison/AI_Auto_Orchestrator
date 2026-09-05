@@ -311,3 +311,7 @@ Polling is V1. For webhook V2: keep `WatchRecord` + `parse_review_marker`, repla
 **Confirmation NO PAID MODEL FALLBACK exists:** Polling code path has no fallback to OpenAI; any `gh` failure → `ERROR` state, no wake. Bridge only runs after valid marker and still requires session verification; on verification failure it fails closed (no spawn). No `try: openai else: fallback` exists.
 
 If any waiting/polling component required a charge, we would STOP and report — none does, so we proceed.
+
+## Commissioning verified
+
+The Stage 1 orchestration workflow has completed its first end-to-end commissioning test.
