@@ -2,6 +2,7 @@ import json
 import hashlib
 import os
 import subprocess
+import sys
 import tempfile
 import traceback
 import unittest
@@ -385,7 +386,7 @@ class SliceCTests(unittest.TestCase):
         self.assertEqual(item["properties"]["severity"]["enum"], ["P0", "P1", "P2", "P3"])
 
     def test_simulator_allows_direct_review_scenario_selection(self):
-        output = subprocess.run(["python3", "-m", "orchestrator.simulator", "--scenario", "review-clean"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        output = subprocess.run([sys.executable, "-m", "orchestrator.simulator", "--scenario", "review-clean"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
         self.assertEqual(output.returncode, 0, output.stderr)
         self.assertEqual(json.loads(output.stdout)["review-clean"]["state"], "complete")
 

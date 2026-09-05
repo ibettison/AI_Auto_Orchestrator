@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,7 +76,7 @@ class LiveReviewPreparationTests(unittest.TestCase):
 
     def test_no_openai_secret_environment_is_needed(self):
         result = subprocess.run(
-            ["python3", "-m", "orchestrator.prepare_live_review", *self.args()],
+            [sys.executable, "-m", "orchestrator.prepare_live_review", *self.args()],
             cwd=self.repo,
             env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(Path(__file__).parents[1])},
             text=True,
