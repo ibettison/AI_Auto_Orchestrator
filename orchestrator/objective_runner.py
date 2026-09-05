@@ -613,11 +613,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", type=Path, default=Path("/opt/ai-orchestrator/config/objective-profile.json"))
     parser.add_argument("--state-dir", type=Path, default=Path("/opt/ai-orchestrator/state/objective-runs"))
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--executor", choices=("codex", "opencode"), default="codex")
+    parser.add_argument("--reviewer", choices=("openai", "opencode"), default="openai")
+    parser.add_argument("--opencode-model", default=None)
     args = parser.parse_args(argv)
     run_id = args.run_id or f"objective-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     try:
         profile = ObjectiveProfile.load(args.profile.resolve())
-        outcome = ObjectiveRunner(CodexSdkExecutor(), OpenAIResponsesReviewer.from_environment(), GitHubAppClient()).execute(
+        if args.executor == "opencode" or args.reviewer == "opencode":
+            from .opencode_runner import OpencodeSelection
+
+            selection = OpencodeSelection(args.executor, args.reviewer, args.opencode_model)
+            codex = selection.make_executor()
+            reviewer = selection.make_reviewer()
+        else:
+            codex, reviewer = CodexSdkExecutor(), OpenAIResponsesReviewer.from_environment()
+        outcome = ObjectiveRunner(codex, reviewer, GitHubAppClient()).execute(
             args.objective, profile, args.state_dir.resolve(), run_id,
         )
         print(json.dumps(asdict(outcome), sort_keys=True))
