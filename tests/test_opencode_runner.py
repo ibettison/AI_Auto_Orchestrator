@@ -183,8 +183,22 @@ class ExecutorTests(unittest.TestCase):
 
     def test_output_cap_fails_closed(self):
         prof = profile(Path("/tmp"), max_output_bytes=16)
+        oversized = '{"type": "text", "text": "' + "y" * 100 + '"}'
+        with self.assertRaises(ObjectiveRunError):
+            OpenCodeExecutor(runner=lambda *a: completed(oversized), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), prof)
+
+    def test_bounded_plain_fallback_succeeds(self):
+        prof = profile(Path("/tmp"), max_output_bytes=16)
+        result = OpenCodeExecutor(runner=lambda *a: completed("x" * 16), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), prof)
+        self.assertEqual(result.final_response, "x" * 16)
+
+    def test_oversized_plain_fallback_fails_closed(self):
+        prof = profile(Path("/tmp"), max_output_bytes=16)
         with self.assertRaises(ObjectiveRunError):
             OpenCodeExecutor(runner=lambda *a: completed("x" * 17), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), prof)
+        with self.assertRaises(ProviderFailure):
+            OpenCodeReviewer(max_output_bytes=16, runner=lambda *a: completed("y" * 17), binary=TEST_BINARY).review(
+                ReviewerTests().request())
 
     def test_openai_api_key_never_passed(self):
         seen = {}
@@ -258,8 +272,9 @@ class ReviewerTests(unittest.TestCase):
             OpenCodeReviewer(runner=timeout_runner, binary=TEST_BINARY).review(self.request())
         with self.assertRaises(ProviderFailure):
             OpenCodeReviewer(runner=lambda *a: completed("x", 2), binary=TEST_BINARY).review(self.request())
+        oversized = '{"type": "text", "text": "' + "z" * 50 + '"}'
         with self.assertRaises(ProviderFailure):
-            OpenCodeReviewer(max_output_bytes=4, runner=lambda *a: completed("x" * 5), binary=TEST_BINARY).review(self.request())
+            OpenCodeReviewer(max_output_bytes=4, runner=lambda *a: completed(oversized), binary=TEST_BINARY).review(self.request())
 
 
 class NoFallbackTests(unittest.TestCase):
@@ -334,6 +349,66 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(edit_calls), 1)
         self.assertEqual(len(review_calls), 1)
         self.assertIn(outcome.head_sha, github.comments[0])
+
+
+class TransportBoundsTests(unittest.TestCase):
+    """Raw transport vs semantic result caps (commissioning-stage1-004)."""
+
+    def large_valid_stream(self, final_text, session="ses_stream1"):
+        envelope = '{"type": "reasoning", "text": "' + "r" * 2000 + '", "metadata": {"k": "v"}}\n'
+        lines = [envelope * 250]  # ~500KB of transport noise
+        lines.append('{"type": "text", "session_id": "%s"}\n' % session)
+        lines.append('{"type": "text", "text": %s}\n' % json.dumps(final_text))
+        return "".join(lines)
+
+    def test_large_valid_stream_succeeds_when_result_bounded(self):
+        stream = self.large_valid_stream("done")
+        self.assertGreater(len(stream.encode()), 256 * 1024)
+        executor = OpenCodeExecutor(runner=lambda *a: completed(stream), binary=TEST_BINARY)
+        result = executor.execute("x", Path("/tmp/ws"), profile(Path("/tmp")))
+        self.assertEqual(result.final_response, "done")
+        self.assertEqual(executor.session_id, "ses_stream1")
+
+    def test_reviewer_extracts_result_from_large_stream(self):
+        payload = {"review_id": "rev-9", "reviewed_head_sha": "b" * 40, "verdict": "approved",
+                   "findings": [], "summary": "ok", "risk": "green", "requires_human": False}
+        stream = self.large_valid_stream(json.dumps(payload), session="ses_rev9")
+        reviewer = OpenCodeReviewer(runner=lambda *a: completed(stream), binary=TEST_BINARY)
+        request = ReviewerTests().request(review_id="rev-9")
+        result = reviewer.review(request)
+        self.assertEqual(result.verdict.value, "approved")
+        self.assertEqual(result.reviewed_head_sha, "b" * 40)
+
+    def test_runaway_raw_transport_fails_closed(self):
+        import orchestrator.opencode_runner as module
+
+        big = [sys.executable, "-c", "import sys; sys.stdout.write('x' * 3000000)"]
+        with mock.patch.object(module, "_MAX_TRANSPORT_BYTES", 1024):
+            with self.assertRaises(ObjectiveRunError):
+                module._default_runner(big, Path("/tmp"), {"PATH": os.environ.get("PATH", "")}, 30)
+
+    def test_real_timeout_kills_bounded(self):
+        import orchestrator.opencode_runner as module
+
+        sleepy = [sys.executable, "-c", "import time; time.sleep(30)"]
+        with self.assertRaises(ObjectiveRunError):
+            module._default_runner(sleepy, Path("/tmp"), {"PATH": os.environ.get("PATH", "")}, 1)
+
+
+class ReadmeScopeTests(unittest.TestCase):
+    """Exact-file allowed paths (commissioning-stage1-003 finding)."""
+
+    def test_readme_exact_file_allowed(self):
+        from orchestrator.runner import PathPolicy
+
+        PathPolicy(("docs", "README.md")).verify(["README.md"])
+        PathPolicy(("docs", "README.md")).verify(["docs/pr-poller.md"])
+
+    def test_docs_only_profile_rejects_readme(self):
+        from orchestrator.runner import PathPolicy, PolicyViolation
+
+        with self.assertRaises(PolicyViolation):
+            PathPolicy(("docs",)).verify(["README.md"])
 
 
 if __name__ == "__main__":

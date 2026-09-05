@@ -9,6 +9,10 @@ Safety properties (mirroring ``CodexSdkExecutor``):
 
 * argv-only subprocesses, allowlisted safe environment with ambient secrets
   stripped, per-call timeouts with process-group kill, bounded output.
+* Raw ``--format json`` transport output and extracted semantic model output
+  carry independent bounds: verbose event streams (reasoning traces, tool
+  echoes) never consume unbounded memory, while oversized model answers
+  still fail closed against the existing result caps.
 * Model output is untrusted data: the executor's changes are contained by the
   existing workspace inventory/``PathPolicy``/immutable-check gates, and the
   reviewer's JSON is validated by ``ReviewResult.validate_against``.
@@ -28,6 +32,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -50,6 +55,12 @@ _REVIEW_MODEL_ENV = "OPENCODE_REVIEW_MODEL"
 _TIMEOUT_ENV = "OPENCODE_TIMEOUT_SECONDS"
 _SESSION_RE = re.compile(r"\bses_[A-Za-z0-9]+\b")
 
+# Hard safety cap for raw opencode transport output. Verbose single turns
+# (reasoning traces, tool echoes) routinely exceed the semantic model-output
+# bound, so transport and semantic limits are tracked independently.
+_MAX_TRANSPORT_BYTES = 2 * 1024 * 1024
+_READ_CHUNK_BYTES = 65536
+
 
 def _opencode_binary() -> str:
     """Resolve the opencode binary without a shell. Fail closed if absent."""
@@ -69,17 +80,50 @@ def _child_environment() -> dict[str, str]:
     return environment
 
 
+def _pump(stream, sink: list[bytes], total: list[int], cap: int, process: "subprocess.Popen[bytes]") -> None:
+    """Drain one pipe; kill the group as soon as the transport cap is passed."""
+    try:
+        while True:
+            chunk = stream.read(_READ_CHUNK_BYTES)
+            if not chunk:
+                return
+            sink.append(chunk)
+            total[0] += len(chunk)
+            if total[0] > cap:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                return
+    except (OSError, ValueError):
+        return
+
+
 def _default_runner(argv: list[str], cwd: Path, env: Mapping[str, str], timeout: float) -> subprocess.CompletedProcess[str]:
-    """Blocking argv-only run with process-group kill on timeout."""
+    """Blocking argv-only run with bounded transport capture and group kill.
+
+    Raw output beyond ``_MAX_TRANSPORT_BYTES`` fails closed instead of
+    accumulating unbounded memory; command timeouts kill the process group.
+    """
     try:
         process = subprocess.Popen(
-            argv, cwd=cwd, env=dict(env), text=True,
+            argv, cwd=cwd, env=dict(env), text=False,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
         )
     except OSError as exc:
         raise ObjectiveRunError(f"opencode spawn failed closed: {_bounded(exc)}") from None
+    assert process.stdout is not None and process.stderr is not None
+    stdout_sink: list[bytes] = []
+    stderr_sink: list[bytes] = []
+    stdout_total, stderr_total = [0], [0]
+    readers = [
+        threading.Thread(target=_pump, args=(process.stdout, stdout_sink, stdout_total, _MAX_TRANSPORT_BYTES, process), daemon=True),
+        threading.Thread(target=_pump, args=(process.stderr, stderr_sink, stderr_total, _MAX_TRANSPORT_BYTES, process), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -94,7 +138,17 @@ def _default_runner(argv: list[str], cwd: Path, env: Mapping[str, str], timeout:
                 pass
             process.wait(timeout=2)
         raise ObjectiveRunError("opencode execution timed out") from None
-    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    finally:
+        for reader in readers:
+            reader.join(timeout=5)
+    stdout = b"".join(stdout_sink)
+    stderr = b"".join(stderr_sink)
+    if len(stdout) > _MAX_TRANSPORT_BYTES or len(stderr) > _MAX_TRANSPORT_BYTES:
+        raise ObjectiveRunError("opencode transport output exceeded bounds")
+    return subprocess.CompletedProcess(
+        argv, process.returncode,
+        stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace"),
+    )
 
 
 # A runner dependency for tests: (argv, cwd, env, timeout) -> CompletedProcess.
@@ -147,6 +201,43 @@ def _extract_session_id(text: str) -> str | None:
                     return value
     match = _SESSION_RE.search(text)
     return match.group(0) if match else None
+
+
+def _extract_event_texts(stdout: str) -> list[str]:
+    """Collect final assistant text from ``--format json`` event lines.
+
+    Observed stream shapes (commissioning turn, read from the local session
+    store): ``{"type":"text","text":...}`` carries the model's answer, while
+    ``reasoning``/``tool``/``step-*``/``patch`` events carry traces and echoes
+    that must not count against the semantic model-output bound.
+    """
+    texts: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "text":
+            text = event.get("text")
+            if isinstance(text, str) and text:
+                texts.append(text)
+    return texts
+
+
+def _extract_event_text(stdout: str) -> str | None:
+    """Return the joined structured ``text``-event answers, or None.
+
+    Returns None when no event text is observable, so callers can apply the
+    fail-closed rule for unrecognised output explicitly instead of silently
+    truncating it into acceptability.
+    """
+    texts = _extract_event_texts(stdout)
+    if texts:
+        return "\n".join(texts)
+    return None
 
 
 def _extract_json_candidates(text: str) -> list[Any]:
@@ -216,12 +307,21 @@ class OpenCodeExecutor:
         if result.returncode != 0:
             raise ObjectiveRunError("opencode execution failed closed")
         stdout = result.stdout or ""
-        if len(stdout.encode()) > profile.max_output_bytes:
+        if len(stdout.encode("utf-8", errors="ignore")) > _MAX_TRANSPORT_BYTES:
+            raise ObjectiveRunError("opencode transport output exceeded bounds")
+        event_text = _extract_event_text(stdout)
+        if event_text is not None:
+            if len(event_text.encode("utf-8", errors="ignore")) > profile.max_output_bytes:
+                raise ObjectiveRunError("opencode output exceeded bounds")
+            semantic = event_text
+        elif len(stdout.encode("utf-8", errors="ignore")) > profile.max_output_bytes:
             raise ObjectiveRunError("opencode output exceeded bounds")
+        else:
+            semantic = stdout
         learned = _extract_session_id(stdout)
         if learned:
             self.session_id = learned
-        return CodexResult(_bounded(stdout, 4096))
+        return CodexResult(_bounded(semantic, 4096))
 
 
 REVIEWER_PREAMBLE = (
@@ -302,9 +402,18 @@ class OpenCodeReviewer:
         if result.returncode != 0:
             raise ProviderFailure("opencode review failed closed")
         stdout = result.stdout or ""
-        if len(stdout.encode()) > self.max_output_bytes:
+        if len(stdout.encode("utf-8", errors="ignore")) > _MAX_TRANSPORT_BYTES:
+            raise ProviderFailure("opencode review transport exceeded bounds")
+        event_text = _extract_event_text(stdout)
+        if event_text is not None:
+            if len(event_text.encode("utf-8", errors="ignore")) > self.max_output_bytes:
+                raise ProviderFailure("opencode review output exceeded bounds")
+            semantic = event_text
+        elif len(stdout.encode("utf-8", errors="ignore")) > self.max_output_bytes:
             raise ProviderFailure("opencode review output exceeded bounds")
-        return stdout
+        else:
+            semantic = stdout
+        return semantic, stdout
 
     @staticmethod
     def _construct(request: ReviewRequest, value: Mapping[str, Any]) -> ReviewResult:
@@ -331,9 +440,9 @@ class OpenCodeReviewer:
         with tempfile.TemporaryDirectory(prefix="opencode-review-") as scratch_name:
             scratch = Path(scratch_name)
             for _ in range(self.max_attempts):
-                stdout = self._invoke(prompt, scratch)
+                semantic, stdout = self._invoke(prompt, scratch)
                 parsed: Mapping[str, Any] | None = None
-                for candidate in reversed(_extract_json_candidates(stdout)):
+                for candidate in reversed(_extract_json_candidates(semantic) + _extract_json_candidates(stdout)):
                     if isinstance(candidate, dict) and "verdict" in candidate:
                         parsed = candidate
                         break
