@@ -364,5 +364,140 @@ class TestPollOnceIntegration(unittest.TestCase):
                 self.assertEqual(watches[watch.key()].state, WatchState.ERROR)
 
 
+class TestWakeFailureRetry(unittest.TestCase):
+    """Regression coverage for PR #23: failed wake must remain retryable.
+
+    Covers: retry eligibility preserved, wake_count/last-action not advanced
+    on failure, subsequent poll can retry, dedup/stale/fail-closed intact.
+    Uses the generic wake path (echo override + no bridge session) unless
+    a test explicitly exercises the bridge status fix.
+    """
+
+    def _github_open_sha(self, sha=SHA):
+        return {"state": "OPEN", "headRefOid": sha, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}
+
+    def test_failed_wake_preserves_retry_eligibility(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value=self._github_open_sha(SHA)):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[VALID_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value=None):
+                        with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=False) as mock_wake:
+                            summary = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                            self.assertEqual(summary["woke"], 0)
+                            self.assertEqual(summary["errors"], 0)
+                            mock_wake.assert_called_once()
+                            watches = load_watches(state_path)
+                            recovered = watches[watch.key()]
+                            # Review state preserved, but wake recording reverted for retry.
+                            self.assertEqual(recovered.state, WatchState.APPROVED)
+                            self.assertEqual(recovered.wake_count, 0)
+                            self.assertIsNone(recovered.last_wake_sha)
+                            self.assertIsNone(recovered.last_action_status)
+                            self.assertIsNone(recovered.last_action_sha)
+
+    def test_failed_wake_retry_succeeds_on_next_poll(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value=self._github_open_sha(SHA)):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[VALID_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value=None):
+                        with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=False):
+                            first = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                            self.assertEqual(first["woke"], 0)
+                        with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=True) as mock_wake2:
+                            second = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                            self.assertEqual(second["woke"], 1)
+                            mock_wake2.assert_called_once()
+                            watches = load_watches(state_path)
+                            final = watches[watch.key()]
+                            self.assertEqual(final.state, WatchState.ACTION_SENT)
+                            self.assertEqual(final.wake_count, 1)
+                            self.assertEqual(final.last_wake_sha, SHA.lower())
+                            self.assertEqual(final.last_action_status, "APPROVED")
+
+    def test_success_dedup_still_works(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value=self._github_open_sha(SHA)):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[VALID_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value=None):
+                        with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=True):
+                            self.assertEqual(poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")["woke"], 1)
+                        with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=True) as mock_wake2:
+                            summary2 = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                            self.assertEqual(summary2["woke"], 0)
+                            mock_wake2.assert_not_called()
+                            watches = load_watches(state_path)
+                            self.assertEqual(watches[watch.key()].wake_count, 1)
+
+    def test_head_change_after_failed_wake_still_rebinds(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value=self._github_open_sha(SHA)):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[VALID_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value=None):
+                        with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=False):
+                            poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+            # HEAD moves A->B while OPEN: must rebind to B WAITING, no wake.
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value=self._github_open_sha(SHA2)):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[VALID_MARKER]):
+                    with mock.patch("orchestrator.pr_poller.trigger_wake") as mock_wake:
+                        summary = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                        self.assertEqual(summary["woke"], 0)
+                        mock_wake.assert_not_called()
+                        watches = load_watches(state_path)
+                        self.assertEqual(watches[watch.key()].expected_sha, SHA2.lower())
+                        self.assertEqual(watches[watch.key()].state, WatchState.WAITING_FOR_REVIEW)
+
+    def test_github_failure_after_failed_wake_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value=self._github_open_sha(SHA)):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[VALID_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value=None):
+                        with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=False):
+                            poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value=None):
+                summary = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
+                self.assertEqual(summary["woke"], 0)
+                self.assertEqual(summary["errors"], 1)
+                watches = load_watches(state_path)
+                self.assertEqual(watches[watch.key()].state, WatchState.ERROR)
+
+    def test_bridge_uses_current_review_state(self):
+        # PR #23 status fix: first detection has last_action_status=None, but
+        # new_watch.state is APPROVED, so the OpenCode bridge must be attempted.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value=self._github_open_sha(SHA)):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[VALID_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value="ses_test123"):
+                        with mock.patch("orchestrator.opencode_bridge.inject_merge", return_value=(True, "ok")) as mock_merge:
+                            with mock.patch("orchestrator.pr_poller.trigger_wake") as mock_generic:
+                                summary = poll_once(state_path=state_path, log_path=log_path, wake_command=None)
+                                self.assertEqual(summary["woke"], 1)
+                                mock_merge.assert_called_once()
+                                mock_generic.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
