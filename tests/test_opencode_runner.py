@@ -20,6 +20,10 @@ from orchestrator.objective_runner import (
 from orchestrator.opencode_runner import OpenCodeExecutor, OpencodeSelection, OpenCodeReviewer
 from orchestrator.reviewer import ProviderFailure, ReviewError, ReviewRequest
 
+# Harmless explicit fake binary so tests never depend on HOME, PATH, the
+# invoking user, or an installed opencode binary.
+TEST_BINARY = "/test/opencode"
+
 
 def completed(text="", code=0):
     return subprocess.CompletedProcess(["opencode", "run"], code, text, "")
@@ -102,10 +106,10 @@ class ExecutorTests(unittest.TestCase):
             return completed('{"session_id": "ses_exec123"}\ndone')
 
         workspace = Path("/tmp/ws")
-        result = OpenCodeExecutor("nebuis/gpt-5-nano", runner).execute(
+        result = OpenCodeExecutor("nebuis/gpt-5-nano", runner, TEST_BINARY).execute(
             "do it", workspace, profile(Path("/tmp")))
         self.assertIsInstance(result, CodexResult)
-        self.assertIn("opencode", seen["argv"][0])
+        self.assertEqual(seen["argv"][0], TEST_BINARY)
         self.assertEqual(seen["argv"][1], "run")
         self.assertIn("do it", seen["argv"])
         self.assertIn("--model", seen["argv"])
@@ -121,7 +125,7 @@ class ExecutorTests(unittest.TestCase):
                 return completed('{"type":"session.created","session_id": "ses_fix999"}\nok')
             return completed("fixed")
 
-        executor = OpenCodeExecutor(runner=runner)
+        executor = OpenCodeExecutor(runner=runner, binary=TEST_BINARY)
         workspace, prof = Path("/tmp/ws"), profile(Path("/tmp"))
         executor.execute("implement", workspace, prof)
         self.assertEqual(executor.session_id, "ses_fix999")
@@ -137,28 +141,50 @@ class ExecutorTests(unittest.TestCase):
             calls.append(list(argv))
             return completed("plain text, no id")
 
-        executor = OpenCodeExecutor(runner=runner)
+        executor = OpenCodeExecutor(runner=runner, binary=TEST_BINARY)
         prof = profile(Path("/tmp"))
         executor.execute("a", Path("/tmp/ws"), prof)
         executor.execute("b", Path("/tmp/ws"), prof)
         self.assertIsNone(executor.session_id)
         self.assertNotIn("--session", calls[1])
 
+    def test_default_binary_resolution_preserved(self):
+        seen = {}
+
+        def runner(argv, cwd, env, timeout):
+            seen["argv"] = list(argv)
+            return completed("ok")
+
+        with mock.patch("orchestrator.opencode_runner._opencode_binary", return_value="/resolved/opencode"):
+            OpenCodeExecutor(runner=runner).execute("x", Path("/tmp/ws"), profile(Path("/tmp")))
+        self.assertEqual(seen["argv"][0], "/resolved/opencode")
+
+    def test_binary_resolver_callable_honored(self):
+        seen = {}
+
+        def runner(argv, cwd, env, timeout):
+            seen["argv"] = list(argv)
+            return completed("ok")
+
+        OpenCodeExecutor(runner=runner, binary=lambda: "/custom/opencode").execute(
+            "x", Path("/tmp/ws"), profile(Path("/tmp")))
+        self.assertEqual(seen["argv"][0], "/custom/opencode")
+
     def test_timeout_fails_closed(self):
         def runner(argv, cwd, env, timeout):
             raise subprocess.TimeoutExpired(argv, timeout)
 
         with self.assertRaises(ObjectiveRunError):
-            OpenCodeExecutor(runner=runner).execute("x", Path("/tmp/ws"), profile(Path("/tmp")))
+            OpenCodeExecutor(runner=runner, binary=TEST_BINARY).execute("x", Path("/tmp/ws"), profile(Path("/tmp")))
 
     def test_nonzero_exit_fails_closed(self):
         with self.assertRaises(ObjectiveRunError):
-            OpenCodeExecutor(runner=lambda *a: completed("nope", 3)).execute("x", Path("/tmp/ws"), profile(Path("/tmp")))
+            OpenCodeExecutor(runner=lambda *a: completed("nope", 3), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), profile(Path("/tmp")))
 
     def test_output_cap_fails_closed(self):
         prof = profile(Path("/tmp"), max_output_bytes=16)
         with self.assertRaises(ObjectiveRunError):
-            OpenCodeExecutor(runner=lambda *a: completed("x" * 17)).execute("x", Path("/tmp/ws"), prof)
+            OpenCodeExecutor(runner=lambda *a: completed("x" * 17), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), prof)
 
     def test_openai_api_key_never_passed(self):
         seen = {}
@@ -168,7 +194,7 @@ class ExecutorTests(unittest.TestCase):
             return completed("ok")
 
         with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sentinel-must-not-pass"}):
-            OpenCodeExecutor(runner=runner).execute("x", Path("/tmp/ws"), profile(Path("/tmp")))
+            OpenCodeExecutor(runner=runner, binary=TEST_BINARY).execute("x", Path("/tmp/ws"), profile(Path("/tmp")))
         self.assertNotIn("OPENAI_API_KEY", seen["env"])
         self.assertNotIn("sentinel-must-not-pass", json.dumps(seen["env"]))
 
@@ -183,7 +209,7 @@ class ReviewerTests(unittest.TestCase):
         return ReviewRequest(**values)
 
     def test_approved_review(self):
-        reviewer = OpenCodeReviewer("free/model", runner=lambda *a: completed(review_json_for(a[0])))
+        reviewer = OpenCodeReviewer("free/model", runner=lambda *a: completed(review_json_for(a[0])), binary=TEST_BINARY)
         result = reviewer.review(self.request())
         self.assertEqual(result.verdict.value, "approved")
         self.assertEqual(result.reviewed_head_sha, "b" * 40)
@@ -196,7 +222,7 @@ class ReviewerTests(unittest.TestCase):
             return completed(review_json_for(argv))
 
         workspace = Path("/tmp/objective-workspace")
-        reviewer = OpenCodeReviewer(runner=runner)
+        reviewer = OpenCodeReviewer(runner=runner, binary=TEST_BINARY)
         reviewer.review(self.request())
         self.assertNotIn("--session", seen["argv"])
         self.assertNotEqual(seen["cwd"], workspace)
@@ -210,7 +236,7 @@ class ReviewerTests(unittest.TestCase):
             return completed("not json at all {{{{")
 
         with self.assertRaises(ProviderFailure):
-            OpenCodeReviewer(runner=runner).review(self.request())
+            OpenCodeReviewer(runner=runner, binary=TEST_BINARY).review(self.request())
         self.assertEqual(len(calls), 2)
 
     def test_wrong_reviewed_sha_fails_closed(self):
@@ -221,7 +247,7 @@ class ReviewerTests(unittest.TestCase):
             return completed(review_json_for(argv, sha="c" * 40))
 
         with self.assertRaises(ReviewError):
-            OpenCodeReviewer(runner=runner).review(self.request())
+            OpenCodeReviewer(runner=runner, binary=TEST_BINARY).review(self.request())
         self.assertEqual(len(calls), 1)
 
     def test_reviewer_timeout_output_cap_and_exit_fail_closed(self):
@@ -229,11 +255,11 @@ class ReviewerTests(unittest.TestCase):
             raise subprocess.TimeoutExpired(["opencode"], 1)
 
         with self.assertRaises(ProviderFailure):
-            OpenCodeReviewer(runner=timeout_runner).review(self.request())
+            OpenCodeReviewer(runner=timeout_runner, binary=TEST_BINARY).review(self.request())
         with self.assertRaises(ProviderFailure):
-            OpenCodeReviewer(runner=lambda *a: completed("x", 2)).review(self.request())
+            OpenCodeReviewer(runner=lambda *a: completed("x", 2), binary=TEST_BINARY).review(self.request())
         with self.assertRaises(ProviderFailure):
-            OpenCodeReviewer(max_output_bytes=4, runner=lambda *a: completed("x" * 5)).review(self.request())
+            OpenCodeReviewer(max_output_bytes=4, runner=lambda *a: completed("x" * 5), binary=TEST_BINARY).review(self.request())
 
 
 class NoFallbackTests(unittest.TestCase):
@@ -245,8 +271,8 @@ class NoFallbackTests(unittest.TestCase):
             os.environ.pop("OPENAI_API_KEY", None)
             with mock.patch("orchestrator.reviewer.OpenAIResponsesReviewer.from_environment",
                              side_effect=AssertionError("must not consult OpenAI")):
-                OpenCodeExecutor(runner=lambda *a: completed("ok")).execute("x", Path("/tmp"), profile(Path("/tmp")))
-                OpenCodeReviewer(runner=lambda *a: completed(review_json_for(a[0]))).review(
+                OpenCodeExecutor(runner=lambda *a: completed("ok"), binary=TEST_BINARY).execute("x", Path("/tmp"), profile(Path("/tmp")))
+                OpenCodeReviewer(runner=lambda *a: completed(review_json_for(a[0])), binary=TEST_BINARY).review(
                     ReviewerTests().request())
 
     def test_selection_factory(self):
@@ -283,8 +309,8 @@ class LoopTests(unittest.TestCase):
             findings = [finding_json()] if verdict == "changes_requested" else []
             return completed(review_json_for(argv, verdict=verdict, findings=findings))
 
-        executor = OpenCodeExecutor("free/model", codex_runner)
-        reviewer = OpenCodeReviewer("free/model", runner=review_runner)
+        executor = OpenCodeExecutor("free/model", codex_runner, TEST_BINARY)
+        reviewer = OpenCodeReviewer("free/model", runner=review_runner, binary=TEST_BINARY)
         outcome = ObjectiveRunner(executor, reviewer, github).execute(
             "Change the app", profile(source), tmp_path / "state", run_id)
         return outcome, github, edit_calls, review_calls
