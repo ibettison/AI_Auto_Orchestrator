@@ -227,17 +227,17 @@ def _extract_event_texts(stdout: str) -> list[str]:
     return texts
 
 
-def _extract_semantic_text(stdout: str, semantic_cap: int) -> str:
-    """Return the bounded model-answer text from raw transport output.
+def _extract_event_text(stdout: str) -> str | None:
+    """Return the joined structured ``text``-event answers, or None.
 
-    Prefers structured ``text`` events; falls back to a bounded tail of raw
-    output when no event text is observable. The result never exceeds
-    ``semantic_cap`` bytes — oversized answers fail closed in the caller.
+    Returns None when no event text is observable, so callers can apply the
+    fail-closed rule for unrecognised output explicitly instead of silently
+    truncating it into acceptability.
     """
     texts = _extract_event_texts(stdout)
     if texts:
         return "\n".join(texts)
-    return stdout.encode("utf-8", errors="ignore")[-semantic_cap:].decode("utf-8", errors="ignore")
+    return None
 
 
 def _extract_json_candidates(text: str) -> list[Any]:
@@ -309,9 +309,15 @@ class OpenCodeExecutor:
         stdout = result.stdout or ""
         if len(stdout.encode("utf-8", errors="ignore")) > _MAX_TRANSPORT_BYTES:
             raise ObjectiveRunError("opencode transport output exceeded bounds")
-        semantic = _extract_semantic_text(stdout, profile.max_output_bytes)
-        if _extract_event_texts(stdout) and len(semantic.encode("utf-8", errors="ignore")) > profile.max_output_bytes:
+        event_text = _extract_event_text(stdout)
+        if event_text is not None:
+            if len(event_text.encode("utf-8", errors="ignore")) > profile.max_output_bytes:
+                raise ObjectiveRunError("opencode output exceeded bounds")
+            semantic = event_text
+        elif len(stdout.encode("utf-8", errors="ignore")) > profile.max_output_bytes:
             raise ObjectiveRunError("opencode output exceeded bounds")
+        else:
+            semantic = stdout
         learned = _extract_session_id(stdout)
         if learned:
             self.session_id = learned
@@ -398,9 +404,15 @@ class OpenCodeReviewer:
         stdout = result.stdout or ""
         if len(stdout.encode("utf-8", errors="ignore")) > _MAX_TRANSPORT_BYTES:
             raise ProviderFailure("opencode review transport exceeded bounds")
-        semantic = _extract_semantic_text(stdout, self.max_output_bytes)
-        if _extract_event_texts(stdout) and len(semantic.encode("utf-8", errors="ignore")) > self.max_output_bytes:
+        event_text = _extract_event_text(stdout)
+        if event_text is not None:
+            if len(event_text.encode("utf-8", errors="ignore")) > self.max_output_bytes:
+                raise ProviderFailure("opencode review output exceeded bounds")
+            semantic = event_text
+        elif len(stdout.encode("utf-8", errors="ignore")) > self.max_output_bytes:
             raise ProviderFailure("opencode review output exceeded bounds")
+        else:
+            semantic = stdout
         return semantic, stdout
 
     @staticmethod

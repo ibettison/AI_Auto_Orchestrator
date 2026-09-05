@@ -187,10 +187,18 @@ class ExecutorTests(unittest.TestCase):
         with self.assertRaises(ObjectiveRunError):
             OpenCodeExecutor(runner=lambda *a: completed(oversized), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), prof)
 
-    def test_plain_text_without_events_uses_bounded_tail(self):
+    def test_bounded_plain_fallback_succeeds(self):
         prof = profile(Path("/tmp"), max_output_bytes=16)
-        result = OpenCodeExecutor(runner=lambda *a: completed("x" * 100), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), prof)
+        result = OpenCodeExecutor(runner=lambda *a: completed("x" * 16), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), prof)
         self.assertEqual(result.final_response, "x" * 16)
+
+    def test_oversized_plain_fallback_fails_closed(self):
+        prof = profile(Path("/tmp"), max_output_bytes=16)
+        with self.assertRaises(ObjectiveRunError):
+            OpenCodeExecutor(runner=lambda *a: completed("x" * 17), binary=TEST_BINARY).execute("x", Path("/tmp/ws"), prof)
+        with self.assertRaises(ProviderFailure):
+            OpenCodeReviewer(max_output_bytes=16, runner=lambda *a: completed("y" * 17), binary=TEST_BINARY).review(
+                ReviewerTests().request())
 
     def test_openai_api_key_never_passed(self):
         seen = {}
