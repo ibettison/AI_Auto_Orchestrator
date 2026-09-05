@@ -411,5 +411,72 @@ class ReadmeScopeTests(unittest.TestCase):
             PathPolicy(("docs",)).verify(["README.md"])
 
 
+class PartTextEnvelopeTests(unittest.TestCase):
+    """True observed CLI envelope shape: content nested at part.text."""
+
+    PROMPT = "REVIEW: return JSON verdict"
+
+    def envelope(self, text, session="ses_env1"):
+        return json.dumps({"type": "text", "timestamp": 1, "sessionID": session,
+                           "part": {"id": "p1", "type": "text", "text": text}})
+
+    def review_payload(self, sha="b" * 40, review_id="rev-1", verdict="approved"):
+        return {"review_id": review_id, "reviewed_head_sha": sha, "verdict": verdict,
+                "findings": [], "summary": "ok", "risk": "green", "requires_human": False}
+
+    def test_nested_part_text_approved_parses(self):
+        answer = json.dumps(self.review_payload())
+        stdout = self.envelope(self.PROMPT) + "\n" + self.envelope(answer)
+        reviewer = OpenCodeReviewer(runner=lambda *a: completed(stdout), binary=TEST_BINARY)
+        request = ReviewerTests().request()
+        result = reviewer.review(request)
+        self.assertEqual(result.verdict.value, "approved")
+        self.assertEqual(result.reviewed_head_sha, "b" * 40)
+
+    def test_prompt_echo_ignored(self):
+        from orchestrator.opencode_runner import _extract_event_texts
+
+        answer = json.dumps(self.review_payload())
+        stdout = self.envelope(self.PROMPT) + "\n" + self.envelope(answer)
+        texts = _extract_event_texts(stdout, (self.PROMPT,))
+        self.assertEqual(texts, [answer])
+
+    def test_malformed_nested_part_ignored(self):
+        from orchestrator.opencode_runner import _extract_event_texts
+
+        bad = [json.dumps({"type": "text", "part": {"type": "text"}}),
+               json.dumps({"type": "text", "part": {"type": "tool", "text": "x"}}),
+               json.dumps({"type": "tool", "part": {"type": "text", "text": "y"}}),
+               "not json at all"]
+        self.assertEqual(_extract_event_texts("\n".join(bad)), [])
+
+    def test_oversized_nested_part_text_fails_closed(self):
+        big = json.dumps({"type": "text", "part": {"type": "text", "text": "z" * 100}})
+        with self.assertRaises(ProviderFailure):
+            OpenCodeReviewer(max_output_bytes=16, runner=lambda *a: completed(big), binary=TEST_BINARY).review(
+                ReviewerTests().request())
+
+    def test_top_level_text_shape_still_works(self):
+        from orchestrator.opencode_runner import _extract_event_texts
+
+        line = json.dumps({"type": "text", "text": "hello"})
+        self.assertEqual(_extract_event_texts(line), ["hello"])
+
+    def test_large_transport_nested_bounded_result_succeeds(self):
+        noise = json.dumps({"type": "reasoning", "text": "r" * 2000}) + "\n"
+        answer = json.dumps(self.review_payload())
+        stdout = noise * 250 + self.envelope(self.PROMPT) + "\n" + self.envelope(answer)
+        self.assertGreater(len(stdout.encode()), 256 * 1024)
+        reviewer = OpenCodeReviewer(runner=lambda *a: completed(stdout), binary=TEST_BINARY)
+        result = reviewer.review(ReviewerTests().request())
+        self.assertEqual(result.verdict.value, "approved")
+
+    def test_no_candidate_still_fails_closed(self):
+        noise = json.dumps({"type": "reasoning", "text": "nothing useful"}) + "\n"
+        with self.assertRaises(ProviderFailure):
+            OpenCodeReviewer(runner=lambda *a: completed(noise * 3), binary=TEST_BINARY).review(
+                ReviewerTests().request())
+
+
 if __name__ == "__main__":
     unittest.main()

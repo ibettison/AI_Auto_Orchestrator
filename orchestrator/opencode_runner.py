@@ -35,7 +35,7 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 from .objective_runner import CodexExecutor, CodexResult, ObjectiveProfile, ObjectiveRunError, _bounded, _safe_environment
 from .reviewer import (
@@ -203,13 +203,16 @@ def _extract_session_id(text: str) -> str | None:
     return match.group(0) if match else None
 
 
-def _extract_event_texts(stdout: str) -> list[str]:
+def _extract_event_texts(stdout: str, exclude: Collection[str] = ()) -> list[str]:
     """Collect final assistant text from ``--format json`` event lines.
 
-    Observed stream shapes (commissioning turn, read from the local session
-    store): ``{"type":"text","text":...}`` carries the model's answer, while
-    ``reasoning``/``tool``/``step-*``/``patch`` events carry traces and echoes
-    that must not count against the semantic model-output bound.
+    Real CLI envelopes nest content one level down (commissioning turn,
+    observed live): ``{"type":"text",…,"part":{"type":"text","text":…}}``.
+    Top-level ``{"type":"text","text":…}`` lines remain supported. Only
+    ``text``-typed events/parts are read — ``reasoning``/``tool``/``step-*``/
+    ``patch`` events carry traces and echoes that must not count against the
+    semantic model-output bound. Exact prompt-echo matches in ``exclude`` are
+    dropped so reviewer parsing never reads our own prompt back.
     """
     texts: list[str] = []
     for line in stdout.splitlines():
@@ -220,21 +223,26 @@ def _extract_event_texts(stdout: str) -> list[str]:
             event = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(event, dict) and event.get("type") == "text":
-            text = event.get("text")
-            if isinstance(text, str) and text:
+        if not isinstance(event, dict) or event.get("type") != "text":
+            continue
+        candidates = [event.get("text")]
+        part = event.get("part")
+        if isinstance(part, dict) and part.get("type") == "text":
+            candidates.append(part.get("text"))
+        for text in candidates:
+            if isinstance(text, str) and text and text not in exclude:
                 texts.append(text)
     return texts
 
 
-def _extract_event_text(stdout: str) -> str | None:
+def _extract_event_text(stdout: str, exclude: Collection[str] = ()) -> str | None:
     """Return the joined structured ``text``-event answers, or None.
 
     Returns None when no event text is observable, so callers can apply the
     fail-closed rule for unrecognised output explicitly instead of silently
     truncating it into acceptability.
     """
-    texts = _extract_event_texts(stdout)
+    texts = _extract_event_texts(stdout, exclude)
     if texts:
         return "\n".join(texts)
     return None
@@ -309,7 +317,7 @@ class OpenCodeExecutor:
         stdout = result.stdout or ""
         if len(stdout.encode("utf-8", errors="ignore")) > _MAX_TRANSPORT_BYTES:
             raise ObjectiveRunError("opencode transport output exceeded bounds")
-        event_text = _extract_event_text(stdout)
+        event_text = _extract_event_text(stdout, (prompt,))
         if event_text is not None:
             if len(event_text.encode("utf-8", errors="ignore")) > profile.max_output_bytes:
                 raise ObjectiveRunError("opencode output exceeded bounds")
@@ -404,7 +412,7 @@ class OpenCodeReviewer:
         stdout = result.stdout or ""
         if len(stdout.encode("utf-8", errors="ignore")) > _MAX_TRANSPORT_BYTES:
             raise ProviderFailure("opencode review transport exceeded bounds")
-        event_text = _extract_event_text(stdout)
+        event_text = _extract_event_text(stdout, (prompt,))
         if event_text is not None:
             if len(event_text.encode("utf-8", errors="ignore")) > self.max_output_bytes:
                 raise ProviderFailure("opencode review output exceeded bounds")
