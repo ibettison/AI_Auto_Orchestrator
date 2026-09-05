@@ -118,7 +118,7 @@ Slice C does not authorise production execution. It does not connect to LayMatch
 
 ## Deliberate limitations
 
-Stage 1 is a bounded single-worker PR executor, not an autonomous production deployer. It does not implement automatic merge, deployment, parallel workers, automatic EC2 wake/stop, or sophisticated container resource isolation. Oversized review input is rejected rather than silently chunked. Installation and live commissioning remain separate explicit decisions.
+Stage 1 is a bounded single-worker PR executor, not an autonomous production deployer. It does not implement automatic merge, deployment, parallel workers, automatic EC2 wake/stop, or sophisticated container resource isolation. Pull requests are independently reviewed before human merge approval. Oversized review input is rejected rather than silently chunked. Installation and live commissioning remain separate explicit decisions.
 
 ## Commissioning verified
 
