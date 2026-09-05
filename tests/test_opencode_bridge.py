@@ -761,6 +761,135 @@ class TestCommentFetchFailClosed(unittest.TestCase):
             self.assertIsNone(result)
 
 
+class TestApprovedVerifyAndStop(unittest.TestCase):
+    """Safety regression: APPROVED must verify-and-stop, never merge."""
+
+    def test_approved_prompt_has_no_merge_command(self):
+        instr = build_merge_instruction(REPO, PR, SHA)
+        lowered = instr.lower()
+        self.assertNotIn("gh pr merge", lowered)
+        self.assertNotIn("/merges", lowered)
+        self.assertNotIn("--squash --delete-branch", instr)
+        self.assertNotIn("repos/", instr)
+
+    def test_approved_prompt_is_verify_and_stop(self):
+        instr = build_merge_instruction(REPO, PR, SHA)
+        self.assertIn("APPROVED", instr)
+        self.assertIn("HUMAN_MERGE_APPROVAL_REQUIRED", instr)
+        self.assertIn("DO NOT MERGE", instr)
+        self.assertIn("STOP", instr)
+        self.assertIn("explicit human approval", instr)
+        self.assertIn(SHA, instr)
+        self.assertIn(SHA[:7], instr)
+        self.assertIn("gh pr view", instr)
+
+    def test_approved_inject_sends_report_without_merge(self):
+        from orchestrator.opencode_bridge import inject_merge
+        captured = {}
+        target = BridgeTarget(session_id="ses_testverify", pid=None, tty=None, title=None, directory=None)
+        with mock.patch("orchestrator.opencode_bridge._get_session_target", return_value=target):
+            with mock.patch("orchestrator.opencode_bridge.verify_target", return_value=(True, "ok")):
+                def fake_inject(session_id, prompt, timeout=30.0):
+                    captured["session_id"] = session_id
+                    captured["prompt"] = prompt
+                    return True, "ok"
+                with mock.patch("orchestrator.opencode_bridge.inject_into_opencode", side_effect=fake_inject):
+                    ok, _ = inject_merge(REPO, PR, SHA, session_id="ses_testverify")
+                    self.assertTrue(ok)
+                    self.assertEqual(captured["session_id"], "ses_testverify")
+                    self.assertNotIn("gh pr merge", captured["prompt"].lower())
+                    self.assertIn("HUMAN_MERGE_APPROVAL_REQUIRED", captured["prompt"])
+
+    def test_approved_inject_never_executes_gh(self):
+        import sqlite3
+        from orchestrator.opencode_bridge import inject_merge
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_db = Path(tmpdir) / "opencode.db"
+            db = sqlite3.connect(str(fake_db))
+            db.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, project_id TEXT, time_updated INTEGER)")
+            db.execute("INSERT INTO session VALUES ('ses_testgh', '/tmp', 'Whizzy', 'global', 123)")
+            db.commit()
+            db.close()
+            with mock.patch("orchestrator.opencode_bridge.OPENCODE_DB", fake_db):
+                with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
+                    with mock.patch("orchestrator.opencode_bridge.subprocess.run") as mrun:
+                        mrun.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                        ok, _ = inject_merge(REPO, PR, SHA, session_id="ses_testgh")
+                        self.assertTrue(ok)
+                        args = mrun.call_args[0][0]
+                        self.assertIsInstance(args, list)
+                        self.assertNotEqual(args[0], "gh")
+                        self.assertNotIn("gh", args[0])
+                        prompt_arg = args[-1]
+                        self.assertNotIn("gh pr merge", prompt_arg.lower())
+                        self.assertIn("HUMAN_MERGE_APPROVAL_REQUIRED", prompt_arg)
+
+    def test_approved_poll_reports_without_merge(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            target = BridgeTarget(session_id="ses_testpoll", pid=None, tty=None, title=None, directory=None)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[APPROVED_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value="ses_testpoll"):
+                        with mock.patch("orchestrator.opencode_bridge._get_session_target", return_value=target):
+                            with mock.patch("orchestrator.opencode_bridge.verify_target", return_value=(True, "ok")):
+                                with mock.patch("orchestrator.opencode_bridge.subprocess.run") as mrun:
+                                    mrun.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                                    with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
+                                        summary = poll_once(state_path=state_path, log_path=log_path, wake_command=None)
+                                        self.assertEqual(summary["woke"], 1)
+                                        prompt_arg = mrun.call_args[0][0][-1]
+                                        self.assertNotIn("gh pr merge", prompt_arg.lower())
+                                        self.assertIn("HUMAN_MERGE_APPROVAL_REQUIRED", prompt_arg)
+                                        watches = load_watches(state_path)
+                                        self.assertEqual(watches[watch.key()].state, WatchState.ACTION_SENT)
+
+    def test_exact_sha_still_enforced_for_approved(self):
+        instr = build_merge_instruction(REPO, PR, SHA)
+        self.assertIn(SHA, instr)
+        self.assertIn("STALE", instr)
+        # Stale marker for an old SHA must not wake the new SHA watch.
+        watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA2, state=WatchState.WAITING_FOR_REVIEW)
+        github_state = {"state": "OPEN", "headRefOid": SHA2, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}
+        new_watch, should_wake = evaluate_watch(watch, github_state, [APPROVED_MARKER])
+        self.assertFalse(should_wake)
+        self.assertEqual(new_watch.state, WatchState.WAITING_FOR_REVIEW)
+
+    def test_changes_requested_still_works(self):
+        from orchestrator.opencode_bridge import inject_fix
+        instr = build_fix_instruction(REPO, PR, SHA, ["F-001 fix typo"])
+        self.assertIn("CHANGES_REQUIRED", instr)
+        self.assertNotIn("gh pr merge", instr.lower())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[CHANGES_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value=None):
+                        with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=True) as mock_wake:
+                            summary = poll_once(state_path=state_path, log_path=log_path, wake_command="echo fix {repo} {pr} {sha}")
+                            self.assertEqual(summary["woke"], 1)
+                            mock_wake.assert_called_once()
+
+    def test_stale_sha_and_github_failure_fail_closed(self):
+        # Stale: marker for SHA must not wake watch bound to SHA2.
+        watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA2, state=WatchState.WAITING_FOR_REVIEW)
+        github_state = {"state": "OPEN", "headRefOid": SHA2, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}
+        new_watch, should_wake = evaluate_watch(watch, github_state, [CHANGES_MARKER])
+        self.assertFalse(should_wake)
+        self.assertEqual(new_watch.state, WatchState.WAITING_FOR_REVIEW)
+        # GitHub failure must be ERROR with no wake.
+        watch2 = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+        new_watch2, should_wake2 = evaluate_watch(watch2, None, [])
+        self.assertFalse(should_wake2)
+        self.assertEqual(new_watch2.state, WatchState.ERROR)
+
+
 import hashlib
 
 if __name__ == "__main__":

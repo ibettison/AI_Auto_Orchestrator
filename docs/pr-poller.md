@@ -168,18 +168,17 @@ On exact-SHA `CHANGES_REQUIRED`:
 6. Poller on next tick sees `HEAD A→B`, **automatically rebinds** `expected_sha` from A to B, `WAITING_FOR_REVIEW` (no manual `add` required; atomic `save_watches`, survives restart). Old review for A not carried; B requires new review.
 7. Do NOT merge.
 
-## Merge Loop (Automatic)
+## Merge Loop (Verify and Stop — Human Approval Required)
 
 On exact-SHA `APPROVED`:
-1. `inject_merge()` builds prompt that tells Whizzy to **re-verify immediately**:
-   - `gh pr view --json state,headRefOid,mergeable,closed,mergedAt` → `OPEN`, `headRefOid==approved SHA`, `closed==false`, `mergedAt==null`
+1. `inject_merge()` builds a verify-and-stop status report that tells Whizzy to **re-verify immediately and STOP**:
+   - `gh pr view --json state,headRefOid,closed,mergedAt` → `OPEN`, `headRefOid==approved SHA`, `closed==false`, `mergedAt==null`
    - re-parse `LAYMATCHED-AI-REVIEW` for same `PR`/`HEAD`/`APPROVED` still applies
    - no newer `CHANGES_REQUIRED` for current HEAD
-   - `mergeable==MERGEABLE` (or `mergeStateStatus==CLEAN`)
-2. If all pass: `gh pr merge ...` (squash/merge per policy), report SHA, `STOP`.
-3. If any differs: **DO NOT MERGE**, fail closed as `ACTION_REQUIRED`, report reason.
-4. `DO NOT DEPLOY`.
-5. State → `APPROVED` → `ACTION_SENT` after injection; deduped per `SHA`.
+2. If all pass: report `HUMAN_MERGE_APPROVAL_REQUIRED` for the exact HEAD and `STOP` — wait for explicit human approval. **DO NOT MERGE.**
+3. If any differs: report `ACTION_REQUIRED` with reason, fail closed, leave PR open.
+4. `DO NOT DEPLOY`. No merge command is ever issued or instructed through any route.
+5. State → `APPROVED` → `ACTION_SENT` after the status report is delivered; deduped per `SHA`.
 
 ## Exact-SHA Safety
 
@@ -188,7 +187,7 @@ On exact-SHA `APPROVED`:
 - `MERGED`/`CLOSED` → terminal, no wake.
 - `gh` failure (PR state **or** comments/reviews API) → `ERROR`, no wake, bounded diagnostic, recovers to `WAITING` on next success. Partial marker source retrieval is not sufficient for permission-bearing decisions (fail closed).
 - Wake only when `STATUS` + `PR` + `HEAD` match `expected_sha` **and** `current HEAD == expected_sha` **and** both GitHub retrievals succeeded.
-- Whizzy double-checks before merge (including mergeability).
+- Whizzy verifies the APPROVED status and reports; it never merges (human merge approval required).
 
 ## How LM-2nd Should Run It (Polling, £0)
 
