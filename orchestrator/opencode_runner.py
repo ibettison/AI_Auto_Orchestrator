@@ -100,6 +100,21 @@ def _default_runner(argv: list[str], cwd: Path, env: Mapping[str, str], timeout:
 # A runner dependency for tests: (argv, cwd, env, timeout) -> CompletedProcess.
 RunnerFn = Callable[[list[str], Path, Mapping[str, str], float], subprocess.CompletedProcess[str]]
 
+# An injected binary path or resolver. Production default is None, which keeps
+# the existing _opencode_binary() resolution (home binary, then PATH).
+BinaryFn = Callable[[], str]
+
+
+def _resolve_binary(binary: str | BinaryFn | None) -> str:
+    if binary is None:
+        return _opencode_binary()
+    if callable(binary):
+        resolved = binary()
+        if not resolved:
+            raise ObjectiveRunError("opencode binary is not available")
+        return resolved
+    return binary
+
 
 def _resolve_model(explicit: str | None, env_name: str) -> str | None:
     if explicit and explicit.strip():
@@ -178,13 +193,15 @@ class OpenCodeExecutor:
     fix turns start fresh — the on-disk workspace still carries the state.
     """
 
-    def __init__(self, model: str | None = None, runner: RunnerFn | None = None):
+    def __init__(self, model: str | None = None, runner: RunnerFn | None = None,
+                 binary: str | BinaryFn | None = None):
         self.model = _resolve_model(model, _MODEL_ENV)
         self.runner = runner or _default_runner
+        self.binary = binary
         self.session_id: str | None = None
 
     def execute(self, prompt: str, workspace: Path, profile: ObjectiveProfile) -> CodexResult:
-        binary = _opencode_binary()
+        binary = _resolve_binary(self.binary)
         argv = [binary, "run", prompt, "--format", "json"]
         if self.model:
             argv += ["--model", self.model]
@@ -234,6 +251,7 @@ class OpenCodeReviewer:
         max_output_bytes: int = 128 * 1024,
         max_attempts: int = 2,
         runner: RunnerFn | None = None,
+        binary: str | BinaryFn | None = None,
     ):
         if timeout_seconds <= 0 or max_output_bytes < 1 or max_attempts < 1:
             raise ReviewError("opencode reviewer bounds must be positive")
@@ -250,6 +268,7 @@ class OpenCodeReviewer:
         self.max_output_bytes = max_output_bytes
         self.max_attempts = min(max_attempts, 2)
         self.runner = runner or _default_runner
+        self.binary = binary
 
     def _prompt(self, request: ReviewRequest) -> str:
         from .reviewer import REVIEW_JSON_SCHEMA
@@ -270,7 +289,7 @@ class OpenCodeReviewer:
         )
 
     def _invoke(self, prompt: str, scratch: Path) -> str:
-        binary = _opencode_binary()
+        binary = _resolve_binary(self.binary)
         argv = [binary, "run", prompt, "--format", "json"]
         if self.model:
             argv += ["--model", self.model]
@@ -336,10 +355,11 @@ class OpencodeSelection:
     executor: str = "codex"
     reviewer: str = "openai"
     model: str | None = None
+    binary: str | BinaryFn | None = None
 
     def make_executor(self, runner: RunnerFn | None = None) -> CodexExecutor:
         if self.executor == "opencode":
-            return OpenCodeExecutor(self.model, runner)
+            return OpenCodeExecutor(self.model, runner, self.binary)
         if self.executor == "codex":
             from .objective_runner import CodexSdkExecutor
 
@@ -348,7 +368,7 @@ class OpencodeSelection:
 
     def make_reviewer(self, runner: RunnerFn | None = None) -> Reviewer:
         if self.reviewer == "opencode":
-            return OpenCodeReviewer(self.model, runner=runner)
+            return OpenCodeReviewer(self.model, runner=runner, binary=self.binary)
         if self.reviewer == "openai":
             from .reviewer import OpenAIResponsesReviewer
 
