@@ -56,6 +56,18 @@ def _bounded(value: object, limit: int = 2048) -> str:
     return str(value).replace("\x00", " ").replace("\r", " ").replace("\n", " ")[:limit]
 
 
+# Retained failure-evidence tail per stream. Small enough to keep journals
+# bounded, large enough to identify the failing test or error. Newlines are
+# preserved (tracebacks stay readable); validation children run without
+# secrets in their environment, and check argv is allowlisted, so tails carry
+# no credential material.
+_EVIDENCE_TAIL_CHARS = 8192
+
+
+def _evidence_text(value: object, limit: int = _EVIDENCE_TAIL_CHARS) -> str:
+    return str(value).replace("\x00", " ")[-limit:]
+
+
 def _safe_environment() -> dict[str, str]:
     return {key: os.environ[key] for key in _SAFE_ENV if key in os.environ}
 
@@ -425,6 +437,23 @@ class ObjectiveRunner:
         return tuple(sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path)))
 
     @staticmethod
+    def _failure_evidence(command_runner: BoundedCommandRunner) -> list[dict[str, object]]:
+        """Bounded evidence for the failed check: last non-passing result only."""
+        if not command_runner.results:
+            return []
+        item = command_runner.results[-1]
+        if item.status == "completed" and (item.exit_code or 0) == 0:
+            return []
+        return [{
+            "argv": [str(arg) for arg in item.argv],
+            "status": item.status,
+            "exit_code": item.exit_code,
+            "failure_reason": _bounded(item.failure_reason or ""),
+            "stdout_tail": _evidence_text(item.stdout),
+            "stderr_tail": _evidence_text(item.stderr),
+        }]
+
+    @staticmethod
     def _checks(workspace: Path, profile: ObjectiveProfile, run: DurableRun) -> Mapping[str, object]:
         audit: list[dict[str, str]] = []
         environment = _safe_environment()
@@ -433,7 +462,11 @@ class ObjectiveRunner:
             profile.check_timeout_seconds, time.monotonic() + profile.check_timeout_seconds * len(profile.required_checks),
             profile.max_output_bytes, audit,
         )
-        results = [command_runner.run(check) for check in profile.required_checks]
+        try:
+            results = [command_runner.run(check) for check in profile.required_checks]
+        except Exception as exc:
+            run.append("VALIDATION_FAILED", error=_bounded(exc), checks=ObjectiveRunner._failure_evidence(command_runner))
+            raise
         evidence = {"passed": True, "checks": [{"argv": list(item.argv), "exit_code": item.exit_code} for item in results]}
         run.append("VALIDATION_PASSED", checks=evidence["checks"])
         return evidence
