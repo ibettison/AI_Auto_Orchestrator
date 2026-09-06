@@ -346,6 +346,28 @@ class TestOpenCodeBridge(unittest.TestCase):
         self.assertIs(mpopen.call_args.kwargs["stderr"], subprocess.DEVNULL)
         self.assertNotIn("start_new_session", mpopen.call_args.kwargs)
 
+    def test_systemd_poll_launches_separate_transient_service(self):
+        target = BridgeTarget(session_id="ses_systemd", pid=None, tty=None, title="Whizzy", directory="/tmp")
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.dict(os.environ, {"AI_ORCHESTRATOR_OPENCODE_TRANSIENT": "1", "HOME": "/home/ec2-user"}):
+            with mock.patch("orchestrator.opencode_bridge._get_session_target", return_value=target):
+                with mock.patch("orchestrator.opencode_bridge.verify_target", return_value=(True, "ok")):
+                    with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
+                        with mock.patch("orchestrator.opencode_bridge.subprocess.Popen", return_value=process) as mpopen:
+                            ok, message = inject_into_opencode("ses_systemd", "continue", launch_grace_seconds=0)
+        self.assertTrue(ok)
+        self.assertIn("accepted", message)
+        args = mpopen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/systemd-run", "--user"])
+        self.assertIn("--wait", args)
+        self.assertIn("--collect", args)
+        self.assertIn("--service-type=exec", args)
+        self.assertIn("/bin/echo", args)
+        self.assertEqual(args[-4:], ["run", "--session", "ses_systemd", "continue"])
+        self.assertNotIn("--scope", args)
+        self.assertNotIn("start_new_session", mpopen.call_args.kwargs)
+
     def test_immediate_continuation_failure_is_reported(self):
         target = BridgeTarget(session_id="ses_failed", pid=None, tty=None, title="Whizzy", directory="/tmp")
         process = mock.Mock()

@@ -45,6 +45,7 @@ Safety properties:
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -70,6 +71,8 @@ _SESSION_ID_PATHS = [
 # Env var override for session ID (useful for tests / manual injection)
 _SESSION_ENV = "WHIZZY_OPENCODE_SESSION_ID"
 _OPENCOD_PID_ENV = "OPENCODE_PID"
+_SYSTEMD_TRANSIENT_ENV = "AI_ORCHESTRATOR_OPENCODE_TRANSIENT"
+_SYSTEMD_RUN = "/usr/bin/systemd-run"
 
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
@@ -289,11 +292,39 @@ def inject_into_opencode(
     ok, reason = verify_target(target)
     if not ok:
         return False, f"target verification failed: {reason}"
-    # Build argv — fixed, no shell, no user-controlled command
+    # Build argv — fixed, no shell, no user-controlled command.  A systemd
+    # oneshot service kills remaining processes in its cgroup when it exits,
+    # so production polling uses a separate transient user service for the
+    # continuation.  Direct Popen remains useful for explicitly non-systemd
+    # invocations and unit tests.
     bin_path = str(OPENCODE_BIN) if OPENCODE_BIN.exists() else "opencode"
-    # We use `opencode run --session <id> <prompt>` — this continues the session
-    # It will invoke the model for that turn; no extra LLM during polling, only here.
-    argv = [bin_path, "run", "--session", session_id, prompt]
+    opencode_argv = [bin_path, "run", "--session", session_id, prompt]
+    if os.environ.get(_SYSTEMD_TRANSIENT_ENV) == "1":
+        # Stable per-session/instruction unit name makes retries idempotent at
+        # the launcher boundary while existing poll state remains the source
+        # of truth for STATUS+SHA duplicate suppression.
+        unit_suffix = hashlib.sha256(f"{session_id}\0{prompt}".encode("utf-8")).hexdigest()[:24]
+        home = str(Path.home())
+        argv = [
+            _SYSTEMD_RUN,
+            "--user",
+            f"--unit=ai-auto-orchestrator-opencode-{unit_suffix}",
+            "--collect",
+            "--wait",
+            "--service-type=exec",
+            "--quiet",
+            f"--setenv=HOME={home}",
+            "--property=NoNewPrivileges=yes",
+            "--property=PrivateTmp=yes",
+            "--property=ProtectSystem=strict",
+            "--property=ProtectHome=read-only",
+            "--property=ReadWritePaths=/home/ec2-user/.local/share/opencode",
+            "--property=ReadWritePaths=/home/ec2-user/.local/state/opencode",
+            "--property=ReadWritePaths=/home/ec2-user/.config/opencode",
+            *opencode_argv,
+        ]
+    else:
+        argv = opencode_argv
     if not math.isfinite(launch_grace_seconds) or launch_grace_seconds < 0:
         return False, "invalid OpenCode launch grace period"
     try:
