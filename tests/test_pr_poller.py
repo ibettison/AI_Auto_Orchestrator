@@ -388,7 +388,7 @@ class TestWakeFailureRetry(unittest.TestCase):
                         with mock.patch("orchestrator.pr_poller.trigger_wake", return_value=False) as mock_wake:
                             summary = poll_once(state_path=state_path, log_path=log_path, wake_command="echo wake")
                             self.assertEqual(summary["woke"], 0)
-                            self.assertEqual(summary["errors"], 0)
+                            self.assertEqual(summary["errors"], 1)
                             mock_wake.assert_called_once()
                             watches = load_watches(state_path)
                             recovered = watches[watch.key()]
@@ -398,6 +398,7 @@ class TestWakeFailureRetry(unittest.TestCase):
                             self.assertIsNone(recovered.last_wake_sha)
                             self.assertIsNone(recovered.last_action_status)
                             self.assertIsNone(recovered.last_action_sha)
+                            self.assertEqual(recovered.error_message, "OpenCode wake failed; retrying on the next poll")
 
     def test_failed_wake_retry_succeeds_on_next_poll(self):
         with tempfile.TemporaryDirectory() as tmpdir:

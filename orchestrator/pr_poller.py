@@ -1141,7 +1141,7 @@ def poll_once(state_path: Path | None = None, log_path: Path | None = None, wake
                      last_observed_review_marker=new_watch.last_observed_review_marker,
                      last_wake_sha=watch.last_wake_sha,
                      wake_count=watch.wake_count,
-                     error_message=None,
+                     error_message="OpenCode wake failed; retrying on the next poll",
                      wake_command=watch.wake_command,
                      last_action_status=watch.last_action_status,
                      last_action_sha=watch.last_action_sha,
@@ -1149,8 +1149,8 @@ def poll_once(state_path: Path | None = None, log_path: Path | None = None, wake
                  )
                  updated_watches[key] = recovered_watch
                  new_watch = recovered_watch
+                 errors += 1
                  _audit_log("wake not triggered (no command or failed)", level=logging.WARNING, extra={"repo": watch.repo, "pr": watch.pr}, log_path=log_path)
-                 # Do not increment errors for wake failure
         # Clean up terminal watches: MERGED, CLOSED, STALE can be kept for audit or removed?
         # We keep them but they will not be polled for wake again. They can be manually removed.
         # Optionally, we could auto-remove MERGED/CLOSED after some time, but for now keep.
