@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -310,16 +311,74 @@ class TestOpenCodeBridge(unittest.TestCase):
             db.close()
             with mock.patch("orchestrator.opencode_bridge.OPENCODE_DB", fake_db):
                 with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/false")):
-                    # PID 1 is init, not opencode, should fail if we pass pid=1
-                    target = BridgeTarget(session_id="ses_test456", pid=1, tty=None, title="Whizzy", directory="/tmp")
-                    ok, reason = verify_target(target)
-                    self.assertFalse(ok)
-                    self.assertIn("not opencode", reason)
+                    # Use a controlled non-OpenCode process rather than PID 1;
+                    # container supervisors can include arbitrary text in PID 1's
+                    # command line.
+                    sleeper = subprocess.Popen(["/bin/sleep", "5"])
+                    try:
+                        target = BridgeTarget(session_id="ses_test456", pid=sleeper.pid, tty=None, title="Whizzy", directory="/tmp")
+                        ok, reason = verify_target(target)
+                        self.assertFalse(ok)
+                        self.assertIn("not opencode", reason)
+                    finally:
+                        sleeper.terminate()
+                        sleeper.wait(timeout=2)
 
     def test_inject_target_missing(self):
-        ok, msg = inject_into_opencode("ses_missing999", "hello", timeout=1)
+        ok, msg = inject_into_opencode("ses_missing999", "hello", launch_grace_seconds=0)
         self.assertFalse(ok)
         self.assertIn("not found", msg)
+
+    def test_long_running_continuation_is_accepted_without_waiting(self):
+        target = BridgeTarget(session_id="ses_running", pid=None, tty=None, title="Whizzy", directory="/tmp")
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch("orchestrator.opencode_bridge._get_session_target", return_value=target):
+            with mock.patch("orchestrator.opencode_bridge.verify_target", return_value=(True, "ok")):
+                with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
+                    with mock.patch("orchestrator.opencode_bridge.subprocess.Popen", return_value=process) as mpopen:
+                        ok, message = inject_into_opencode("ses_running", "continue", launch_grace_seconds=0)
+        self.assertTrue(ok)
+        self.assertIn("accepted", message)
+        self.assertEqual(mpopen.call_args.args[0], ["/bin/echo", "run", "--session", "ses_running", "continue"])
+        self.assertIs(mpopen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(mpopen.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(mpopen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertNotIn("start_new_session", mpopen.call_args.kwargs)
+
+    def test_systemd_poll_launches_separate_transient_service(self):
+        target = BridgeTarget(session_id="ses_systemd", pid=None, tty=None, title="Whizzy", directory="/tmp")
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.dict(os.environ, {"AI_ORCHESTRATOR_OPENCODE_TRANSIENT": "1", "HOME": "/home/ec2-user"}):
+            with mock.patch("orchestrator.opencode_bridge._get_session_target", return_value=target):
+                with mock.patch("orchestrator.opencode_bridge.verify_target", return_value=(True, "ok")):
+                    with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
+                        with mock.patch("orchestrator.opencode_bridge.subprocess.Popen", return_value=process) as mpopen:
+                            ok, message = inject_into_opencode("ses_systemd", "continue", launch_grace_seconds=0)
+        self.assertTrue(ok)
+        self.assertIn("accepted", message)
+        args = mpopen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/systemd-run", "--user"])
+        self.assertIn("--wait", args)
+        self.assertIn("--collect", args)
+        self.assertIn("--service-type=exec", args)
+        self.assertIn("/bin/echo", args)
+        self.assertEqual(args[-4:], ["run", "--session", "ses_systemd", "continue"])
+        self.assertNotIn("--scope", args)
+        self.assertNotIn("start_new_session", mpopen.call_args.kwargs)
+
+    def test_immediate_continuation_failure_is_reported(self):
+        target = BridgeTarget(session_id="ses_failed", pid=None, tty=None, title="Whizzy", directory="/tmp")
+        process = mock.Mock()
+        process.poll.return_value = 17
+        with mock.patch("orchestrator.opencode_bridge._get_session_target", return_value=target):
+            with mock.patch("orchestrator.opencode_bridge.verify_target", return_value=(True, "ok")):
+                with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
+                    with mock.patch("orchestrator.opencode_bridge.subprocess.Popen", return_value=process):
+                        ok, message = inject_into_opencode("ses_failed", "continue", launch_grace_seconds=0)
+        self.assertFalse(ok)
+        self.assertIn("failed rc=17", message)
 
     def test_build_fix_instruction_deterministic(self):
         instr = build_fix_instruction(REPO, PR, SHA, ["F-001 typo", "F-002 missing test"])
@@ -371,17 +430,17 @@ F-002 ; echo hacked
             db.close()
             with mock.patch("orchestrator.opencode_bridge.OPENCODE_DB", fake_db):
                 with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
-                    with mock.patch("orchestrator.opencode_bridge.subprocess.run") as mrun:
-                        mrun.return_value = mock.Mock(returncode=0, stdout="", stderr="")
-                        ok, _ = inject_into_opencode("ses_test789", instr, timeout=2)
+                    with mock.patch("orchestrator.opencode_bridge.subprocess.Popen") as mpopen:
+                        mpopen.return_value = mock.Mock(poll=mock.Mock(return_value=0))
+                        ok, _ = inject_into_opencode("ses_test789", instr, launch_grace_seconds=0)
                         self.assertTrue(ok)
-                        args = mrun.call_args[0][0]
+                        args = mpopen.call_args[0][0]
                         # Verify subprocess was called without shell=True and with fixed argv structure
                         self.assertIsInstance(args, list)
                         self.assertEqual(args[0], "/bin/echo")
                         self.assertIn("ses_test789", args)
                         # Ensure shell was not used (no shell=True in call kwargs)
-                        call_kwargs = mrun.call_args[1]
+                        call_kwargs = mpopen.call_args[1]
                         self.assertNotIn("shell", call_kwargs)
                         # The malicious content is inside the prompt arg, not as separate shell command
                         prompt_arg = args[-1]
@@ -501,6 +560,40 @@ class TestPollOnceFixLoop(unittest.TestCase):
                             # Second poll should not re-wake
                             summary2 = poll_once(state_path=state_path, log_path=log_path, wake_command="echo fix")
                             self.assertEqual(summary2["woke"], 0)
+
+    def test_bridge_launch_failure_retries_then_deduplicates_after_acceptance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "watches.json"
+            log_path = Path(tmpdir) / "log"
+            watch = WatchRecord(repo=REPO, pr=PR, expected_sha=SHA, state=WatchState.WAITING_FOR_REVIEW)
+            save_watches({watch.key(): watch}, state_path)
+            target = BridgeTarget(session_id="ses_retry", pid=None, tty=None, title="Whizzy", directory="/tmp")
+            failed_process = mock.Mock(poll=mock.Mock(return_value=17))
+            accepted_process = mock.Mock(poll=mock.Mock(return_value=0))
+            with mock.patch("orchestrator.pr_poller.get_pr_state", return_value={"state": "OPEN", "headRefOid": SHA, "mergeable": "MERGEABLE", "closed": False, "mergedAt": None}):
+                with mock.patch("orchestrator.pr_poller.get_pr_comments_and_reviews", return_value=[CHANGES_MARKER]):
+                    with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value="ses_retry"):
+                        with mock.patch("orchestrator.opencode_bridge._get_session_target", return_value=target):
+                            with mock.patch("orchestrator.opencode_bridge.verify_target", return_value=(True, "ok")):
+                                with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
+                                    with mock.patch("orchestrator.opencode_bridge.subprocess.Popen", side_effect=[failed_process, accepted_process]) as mpopen:
+                                        first = poll_once(state_path=state_path, log_path=log_path, wake_command=None)
+                                        self.assertEqual(first["woke"], 0)
+                                        self.assertEqual(first["errors"], 1)
+                                        failed = load_watches(state_path)[watch.key()]
+                                        self.assertEqual(failed.wake_count, 0)
+                                        self.assertIn("retrying", failed.error_message or "")
+
+                                        second = poll_once(state_path=state_path, log_path=log_path, wake_command=None)
+                                        self.assertEqual(second["woke"], 1)
+                                        accepted = load_watches(state_path)[watch.key()]
+                                        self.assertEqual(accepted.wake_count, 1)
+                                        self.assertEqual(accepted.last_action_sha, SHA)
+                                        self.assertEqual(accepted.last_action_status, "CHANGES_REQUIRED")
+
+                                        third = poll_once(state_path=state_path, log_path=log_path, wake_command=None)
+                                        self.assertEqual(third["woke"], 0)
+                                        self.assertEqual(mpopen.call_count, 2)
 
 
 class TestAutoRebindDetailed(unittest.TestCase):
@@ -812,11 +905,11 @@ class TestApprovedVerifyAndStop(unittest.TestCase):
             db.close()
             with mock.patch("orchestrator.opencode_bridge.OPENCODE_DB", fake_db):
                 with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
-                    with mock.patch("orchestrator.opencode_bridge.subprocess.run") as mrun:
-                        mrun.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                    with mock.patch("orchestrator.opencode_bridge.subprocess.Popen") as mpopen:
+                        mpopen.return_value = mock.Mock(poll=mock.Mock(return_value=0))
                         ok, _ = inject_merge(REPO, PR, SHA, session_id="ses_testgh")
                         self.assertTrue(ok)
-                        args = mrun.call_args[0][0]
+                        args = mpopen.call_args[0][0]
                         self.assertIsInstance(args, list)
                         self.assertNotEqual(args[0], "gh")
                         self.assertNotIn("gh", args[0])
@@ -836,12 +929,12 @@ class TestApprovedVerifyAndStop(unittest.TestCase):
                     with mock.patch("orchestrator.opencode_bridge.discover_session_id", return_value="ses_testpoll"):
                         with mock.patch("orchestrator.opencode_bridge._get_session_target", return_value=target):
                             with mock.patch("orchestrator.opencode_bridge.verify_target", return_value=(True, "ok")):
-                                with mock.patch("orchestrator.opencode_bridge.subprocess.run") as mrun:
-                                    mrun.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                                with mock.patch("orchestrator.opencode_bridge.subprocess.Popen") as mpopen:
+                                    mpopen.return_value = mock.Mock(poll=mock.Mock(return_value=0))
                                     with mock.patch("orchestrator.opencode_bridge.OPENCODE_BIN", Path("/bin/echo")):
                                         summary = poll_once(state_path=state_path, log_path=log_path, wake_command=None)
                                         self.assertEqual(summary["woke"], 1)
-                                        prompt_arg = mrun.call_args[0][0][-1]
+                                        prompt_arg = mpopen.call_args[0][0][-1]
                                         self.assertNotIn("gh pr merge", prompt_arg.lower())
                                         self.assertIn("HUMAN_MERGE_APPROVAL_REQUIRED", prompt_arg)
                                         watches = load_watches(state_path)

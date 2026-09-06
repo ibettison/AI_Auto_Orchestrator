@@ -45,6 +45,8 @@ Safety properties:
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import re
 import shlex
@@ -69,6 +71,8 @@ _SESSION_ID_PATHS = [
 # Env var override for session ID (useful for tests / manual injection)
 _SESSION_ENV = "WHIZZY_OPENCODE_SESSION_ID"
 _OPENCOD_PID_ENV = "OPENCODE_PID"
+_SYSTEMD_TRANSIENT_ENV = "AI_ORCHESTRATOR_OPENCODE_TRANSIENT"
+_SYSTEMD_RUN = "/usr/bin/systemd-run"
 
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
@@ -265,11 +269,21 @@ def build_merge_instruction(repo: str, pr: int, sha: str) -> str:
     )
 
 
-def inject_into_opencode(session_id: str, prompt: str, timeout: float = 30.0) -> tuple[bool, str]:
+def inject_into_opencode(
+    session_id: str,
+    prompt: str,
+    launch_grace_seconds: float = 1.0,
+) -> tuple[bool, str]:
     """Inject prompt into existing OpenCode session via `opencode run --session`.
 
-    Returns (success, output_or_error). This is visible live in the TUI.
+    Returns (accepted, output_or_error). This is visible live in the TUI.
     Does NOT use shell, does NOT use tmux, does NOT require PTY injection.
+
+    OpenCode's ``run --session`` command remains attached while the model turn
+    runs, so completion is not the right boundary for this oneshot poller.
+    We only wait long enough to identify an immediate launch failure.  A
+    still-running child is accepted and remains in the caller's process group
+    (and therefore the systemd service cgroup); it is not daemonized.
     """
     # Verify session exists first
     target = _get_session_target(session_id)
@@ -278,32 +292,67 @@ def inject_into_opencode(session_id: str, prompt: str, timeout: float = 30.0) ->
     ok, reason = verify_target(target)
     if not ok:
         return False, f"target verification failed: {reason}"
-    # Build argv — fixed, no shell, no user-controlled command
+    # Build argv — fixed, no shell, no user-controlled command.  A systemd
+    # oneshot service kills remaining processes in its cgroup when it exits,
+    # so production polling uses a separate transient user service for the
+    # continuation.  Direct Popen remains useful for explicitly non-systemd
+    # invocations and unit tests.
     bin_path = str(OPENCODE_BIN) if OPENCODE_BIN.exists() else "opencode"
-    # We use `opencode run --session <id> <prompt>` — this continues the session
-    # It will invoke the model for that turn; no extra LLM during polling, only here.
-    argv = [bin_path, "run", "--session", session_id, prompt]
+    opencode_argv = [bin_path, "run", "--session", session_id, prompt]
+    if os.environ.get(_SYSTEMD_TRANSIENT_ENV) == "1":
+        # Stable per-session/instruction unit name makes retries idempotent at
+        # the launcher boundary while existing poll state remains the source
+        # of truth for STATUS+SHA duplicate suppression.
+        unit_suffix = hashlib.sha256(f"{session_id}\0{prompt}".encode("utf-8")).hexdigest()[:24]
+        home = str(Path.home())
+        argv = [
+            _SYSTEMD_RUN,
+            "--user",
+            f"--unit=ai-auto-orchestrator-opencode-{unit_suffix}",
+            "--collect",
+            "--wait",
+            "--service-type=exec",
+            "--quiet",
+            f"--setenv=HOME={home}",
+            "--property=NoNewPrivileges=yes",
+            "--property=PrivateTmp=yes",
+            "--property=ProtectSystem=strict",
+            "--property=ProtectHome=read-only",
+            "--property=ReadWritePaths=/home/ec2-user/.local/share/opencode",
+            "--property=ReadWritePaths=/home/ec2-user/.local/state/opencode",
+            "--property=ReadWritePaths=/home/ec2-user/.config/opencode",
+            *opencode_argv,
+        ]
+    else:
+        argv = opencode_argv
+    if not math.isfinite(launch_grace_seconds) or launch_grace_seconds < 0:
+        return False, "invalid OpenCode launch grace period"
     try:
-        # Use short timeout for spawn; the model turn itself may be long, but we
-        # fire-and-forget? Actually `run` waits for the model turn to start.
-        # We use a subprocess that detaches? For now run synchronously with timeout
-        # but allow longer timeout for LM-2nd to handle model invocation.
-        # We do NOT use shell=True.
-        result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
-        # opencode run returns 0 on successful enqueue/start; non-zero is failure
-        if result.returncode != 0:
-            # Include stderr but sanitized (no secrets)
-            err = (result.stderr or result.stdout or "")[:500].replace("\n", " ")
-            return False, f"opencode run failed rc={result.returncode}: {err[:200]}"
-        return True, (result.stdout or "")[:1000]
+        # Keep the child in the inherited process group/cgroup.  In particular,
+        # do not use start_new_session=True: systemd must retain lifecycle
+        # control over a continuation after this oneshot exits.
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        deadline = time.monotonic() + launch_grace_seconds
+        while True:
+            returncode = process.poll()
+            if returncode is not None:
+                if returncode != 0:
+                    return False, f"opencode run failed rc={returncode}"
+                return True, "opencode continuation completed"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True, "opencode continuation accepted"
+            time.sleep(min(0.01, remaining))
     except FileNotFoundError:
         return False, "opencode binary not found"
-    except subprocess.TimeoutExpired as exc:
-        # Timeout may still mean injection succeeded (model turn started) — check DB
-        # For safety, we treat timeout as failure but log it; caller can retry via dedup
-        return False, f"opencode run timeout: {exc}"
     except OSError as exc:
-        return False, f"opencode run OSError: {exc}"
+        return False, f"opencode run OSError: {str(exc)[:200]}"
 
 
 def inject_fix(repo: str, pr: int, sha: str, findings: list[str] | None, session_id: str | None = None) -> tuple[bool, str]:
@@ -316,7 +365,7 @@ def inject_fix(repo: str, pr: int, sha: str, findings: list[str] | None, session
     if _get_session_target(sid) is None:
         return False, f"session {sid[:12]} not found"
     prompt = build_fix_instruction(repo, pr, sha, findings)
-    return inject_into_opencode(sid, prompt, timeout=30.0)
+    return inject_into_opencode(sid, prompt)
 
 
 def inject_merge(repo: str, pr: int, sha: str, session_id: str | None = None) -> tuple[bool, str]:
@@ -327,4 +376,4 @@ def inject_merge(repo: str, pr: int, sha: str, session_id: str | None = None) ->
     if _get_session_target(sid) is None:
         return False, f"session {sid[:12]} not found"
     prompt = build_merge_instruction(repo, pr, sha)
-    return inject_into_opencode(sid, prompt, timeout=30.0)
+    return inject_into_opencode(sid, prompt)

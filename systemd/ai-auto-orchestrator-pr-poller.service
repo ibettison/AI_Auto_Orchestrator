@@ -29,6 +29,7 @@ User=ec2-user
 Group=ec2-user
 # Use the commissioned orchestrator venv — never pass OPENAI_API_KEY to the poller.
 Environment=AI_ORCHESTRATOR_VENV=/opt/ai-orchestrator/venv
+Environment=AI_ORCHESTRATOR_OPENCODE_TRANSIENT=1
 # Ensure writable state/log/config directories exist under ec2-user HOME
 # before mount namespacing. Runs privileged (+ prefix) to bypass
 # ProtectSystem/ProtectHome for creation, then chowns to ec2-user.
