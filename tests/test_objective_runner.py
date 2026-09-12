@@ -362,6 +362,36 @@ def check_repeated_finding_stops_without_a_second_fix(tmp_path):
     assert codex.calls == 2
 
 
+def check_failed_check_evidence_survives_cleanup(tmp_path):
+    source = source_repo(tmp_path)
+    checks = (("python3", "-c", "print('STDOUT-MARKER-12345') or 1/0"),)
+    with raises(ObjectiveRunError):
+        ObjectiveRunner(EditingCodex([change_app("implemented\n")]), CallableReviewer(approved), FakeGitHub()).execute(
+            "Change the app", profile(source, checks=checks), tmp_path / "state", "run-evidence")
+    events = [json.loads(line) for line in (tmp_path / "state/run-evidence/events.jsonl").read_text().splitlines()]
+    failed = [item for item in events if item["event"] == "VALIDATION_FAILED"]
+    assert len(failed) == 1
+    details = failed[0]["details"]
+    assert details["checks"][0]["argv"] == ["python3", "-c", "print('STDOUT-MARKER-12345') or 1/0"]
+    assert details["checks"][0]["exit_code"] == 1
+    assert "STDOUT-MARKER-12345" in details["checks"][0]["stdout_tail"]
+    assert "ZeroDivisionError" in details["checks"][0]["stderr_tail"]
+    assert not (tmp_path / "state/run-evidence/workspace").exists()
+    assert json.loads((tmp_path / "state/run-evidence/result.json").read_text())["state"] == "human_decision_required"
+
+
+def check_failed_check_evidence_tails_bounded(tmp_path):
+    source = source_repo(tmp_path)
+    checks = (("python3", "-c", "print('y' * 20000) or 1/0"),)
+    with raises(ObjectiveRunError):
+        ObjectiveRunner(EditingCodex([change_app("implemented\n")]), CallableReviewer(approved), FakeGitHub()).execute(
+            "Change the app", profile(source, checks=checks), tmp_path / "state", "run-evidence-bound")
+    events = [json.loads(line) for line in (tmp_path / "state/run-evidence-bound/events.jsonl").read_text().splitlines()]
+    failed = next(item for item in events if item["event"] == "VALIDATION_FAILED")
+    for key in ("stdout_tail", "stderr_tail"):
+        assert len(failed["details"]["checks"][0][key]) <= 8192
+
+
 def check_incomplete_run_requires_human_recovery(tmp_path):
     run_dir = tmp_path / "state" / "run-8"
     run_dir.mkdir(parents=True)
@@ -424,6 +454,12 @@ class TestObjectiveRunner(unittest.TestCase):
 
     def test_repeated_finding_stops_without_a_second_fix(self):
         self.invoke(check_repeated_finding_stops_without_a_second_fix)
+
+    def test_failed_check_evidence_survives_cleanup(self):
+        self.invoke(check_failed_check_evidence_survives_cleanup)
+
+    def test_failed_check_evidence_tails_bounded(self):
+        self.invoke(check_failed_check_evidence_tails_bounded)
 
     def test_incomplete_run_requires_human_recovery(self):
         self.invoke(check_incomplete_run_requires_human_recovery)
