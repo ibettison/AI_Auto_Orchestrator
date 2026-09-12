@@ -75,10 +75,15 @@ class LiveReviewPreparationTests(unittest.TestCase):
                 self.assertEqual(main(self.args(**{"--output": output})), 2)
 
     def test_no_openai_secret_environment_is_needed(self):
+        fake_bin = Path(self.temp.name) / "fake-bin"
+        fake_bin.mkdir()
+        fake_python = fake_bin / "python3"
+        fake_python.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+        fake_python.chmod(0o755)
         result = subprocess.run(
             [sys.executable, "-m", "orchestrator.prepare_live_review", *self.args()],
             cwd=self.repo,
-            env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(Path(__file__).parents[1])},
+            env={"PATH": f"{fake_bin}:/usr/bin:/bin", "PYTHONPATH": str(Path(__file__).parents[1])},
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
